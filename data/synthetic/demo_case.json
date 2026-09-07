@@ -1,0 +1,42 @@
+{
+  "description": "Synthetic demo case: Multi-hop transfer to exchange with partial splits",
+  "seed_address": "0x742d35Cc6634C0532925a3b8D4C0532925a3b8D4",
+  "chain": "ethereum",
+  "expected_path": [
+    "0x742d35Cc6634C0532925a3b8D4C0532925a3b8D4",
+    "0x8ba1f109551bD432803012645Hac136c772c3b45",
+    "0x9c12f109551bD432803012645Hac136c772c3b45",
+    "0x1a2b3c4d5e6f78901a2b3c4d5e6f78901a2b3c4d",
+    "0x28C6c06298d514Db089934071355E5743bf21d60"
+  ],
+  "expected_amounts": [
+    "10000.0",
+    "9800.0",
+    "9600.0",
+    "9500.0",
+    "9450.0"
+  ],
+  "expected_tokens": [
+    "USDT",
+    "USDT",
+    "USDT",
+    "USDT",
+    "USDT"
+  ],
+  "suspicious_patterns": [
+    {
+      "address": "0x8ba1f109551bD432803012645Hac136c772c3b45",
+      "pattern": "peel_behavior"
+    },
+    {
+      "address": "0x9c12f109551bD432803012645Hac136c772c3b45",
+      "pattern": "hop_velocity"
+    }
+  ],
+  "expected_endpoint": {
+    "address": "0x28C6c06298d514Db089934071355E5743bf21d60",
+    "label": "Binance",
+    "entity_type": "exchange",
+    "confidence": 0.85
+  }
+}

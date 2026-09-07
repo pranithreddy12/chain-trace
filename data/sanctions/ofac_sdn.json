@@ -1,0 +1,50 @@
+[
+  {
+    "address": "0x722122df12d4e14e13ac3b6895a86e84145b6967",
+    "chain": "ethereum",
+    "label": "Tornado Cash",
+    "category": "sanctioned",
+    "source": "ofac_sdn",
+    "confidence": 1.0
+  },
+  {
+    "address": "0x8589427373D6D84E98730D7795D8f6f8731FDA16",
+    "chain": "ethereum",
+    "label": "Tornado Cash: Donation",
+    "category": "sanctioned",
+    "source": "ofac_sdn",
+    "confidence": 1.0
+  },
+  {
+    "address": "0xDD4c48C0B24039969fC16D1cdF626eaB821d3384",
+    "chain": "ethereum",
+    "label": "Tornado Cash: 0.1 ETH",
+    "category": "sanctioned",
+    "source": "ofac_sdn",
+    "confidence": 1.0
+  },
+  {
+    "address": "0xd90e2f925DA726b50C4Ed8D0Fb90Ad053324F31b",
+    "chain": "ethereum",
+    "label": "Tornado Cash: 1 ETH",
+    "category": "sanctioned",
+    "source": "ofac_sdn",
+    "confidence": 1.0
+  },
+  {
+    "address": "0xF60dD140cFf0706bAE9Cd734Ac3ae76AD9eBC32A",
+    "chain": "ethereum",
+    "label": "Tornado Cash: 100 ETH",
+    "category": "sanctioned",
+    "source": "ofac_sdn",
+    "confidence": 1.0
+  },
+  {
+    "address": "0x098B716B8Aaf21512996dC57EB0615e2383E2f96",
+    "chain": "ethereum",
+    "label": "Lazarus Group (Ronin Bridge exploiter)",
+    "category": "sanctioned",
+    "source": "ofac_sdn",
+    "confidence": 1.0
+  }
+]

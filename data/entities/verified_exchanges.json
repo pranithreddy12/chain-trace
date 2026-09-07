@@ -1,0 +1,26 @@
+[
+  {
+    "address": "0x28C6c06298d514Db089934071355E5743bf21d60",
+    "chain": "ethereum",
+    "label": "Binance",
+    "category": "exchange",
+    "source": "verified_exchange",
+    "confidence": 0.85
+  },
+  {
+    "address": "0x21a31Ee1afC51d94C2eFcAAa2092aD1028285549",
+    "chain": "ethereum",
+    "label": "Binance 2",
+    "category": "exchange",
+    "source": "verified_exchange",
+    "confidence": 0.85
+  },
+  {
+    "address": "0x3f5CE5FBFe3E9af3971dD833D26bA9b5C936f0bE",
+    "chain": "ethereum",
+    "label": "Binance 3",
+    "category": "exchange",
+    "source": "verified_exchange",
+    "confidence": 0.85
+  }
+]
