@@ -751,3 +751,147 @@ ended the fetch early and hid later outgoing pages. It now breaks only when the
 provider returns nothing at all.
 
 Tests: 89 pass (4 new in TestTraceModes).
+
+### "Amount 0.0000" was a display bug, and revealed address poisoning
+TYD4pB7wGi1p8zK67rBTV3KdfEb9nvNDXh showed a page of TRX transfers all reading
+0.0000. They are not zero: the real amount is 0.000001 TRX (1 sun) and the
+table's `%.4f` NumberColumn rounded it away. 200 of that wallet's 237 transfers
+are 1-sun sends fired at 200 distinct lookalike addresses in one burst - a
+textbook ADDRESS POISONING spray (the attacker wants the victim to copy a
+poisoned address out of their history). The wallet also receives scam tokens
+whose SYMBOLS are adverts: "U567. C0M", "SWAP AT SYNTHETIX.TO".
+Fixes: Amount column now `%.6f` (TRX and Tron-USDT are both 6dp), a `Dust`
+column flags anything under 0.001 units, a "Hide dust (N)" toggle filters them
+out of the table, and Min amount accepts 6 decimals.
+Dust is HIDDEN, never dropped - the spray is itself evidence of targeting.
+CAVEAT: `%.6f` still renders 18-decimal ERC-20 dust as 0.000000.
+STILL OPEN: dust is not excluded from the GRAPH, so 200 poisoning edges can
+exhaust the branch limit and the time budget and pollute the counterparty list,
+especially in ACTIVITY mode. Needs a decision: skip dust recipients when
+expanding (keep the edges), and/or raise a "wallet targeted by address
+poisoning" finding.
+
+### Dust / address-poisoning handling (done)
+Settings: `dust_amount_threshold` (0.001 units), `poisoning_min_dust_sends` (15).
+
+**Traversal.** Dust transfers still become EDGES (the spray is evidence the
+wallet was targeted) but their recipients are never expanded and never count
+against the branch limit, in BOTH forensic and activity mode. Without this a
+300-send spray consumed the entire branch budget and, in activity mode, would
+have triggered 300 paginated fetches.
+
+**Detector** `PatternDetector.detect_address_poisoning` needs >=2 signals:
+  - >= poisoning_min_dust_sends dust transfers to distinct addresses
+  - a dust target that is a LOOKALIKE (same first-4 and last-4 chars) of any
+    genuine address in the case - compare against ALL genuine addresses, not
+    just the sprayer's own counterparties: the impersonated address usually
+    belongs to the victim, not the sprayer
+  - every send being byte-identical (scripted spray, not payments)
+  - the whole spray inside 24h
+Severity high only when a lookalike is found; otherwise medium and the wording
+explicitly says intent is unconfirmed (could be airdrop spam) - do not assert
+intent that has not been evidenced.
+
+Verified on TYD4pB7wGi1p8zK67rBTV3KdfEb9nvNDXh: 300 dust sends, all exactly
+0.000001 TRX, within 93m -> detected, medium severity, recipients not expanded.
+
+Gotcha hit while testing: TronGrid rate-limits under repeated runs and returns
+an EMPTY graph. Always print node/edge counts in probe scripts - an empty run
+looks exactly like a detector that failed to fire.
+
+### "in 0 / out 0" and floating unconnected stars - two separate bugs (fixed)
+**BUG A: activity mode never recorded node amounts.** `_absorb_activity` added
+nodes and edges directly and bypassed `_process_transfer`, so
+`incoming_amount` / `outgoing_amount` / `first_seen` / `last_seen` stayed at
+their defaults. Every tooltip read "in 0 - out 0", node sizes (derived from
+amounts) were uniform, and `_keep_nodes`' rank-by-amount pruning was ranking on
+all-zeros, i.e. arbitrary.
+Fix: extracted `TraceEngine._record_amounts(ctx, transfer)`; BOTH the forensic
+`_process_transfer` and activity's `_absorb_activity` now route through it.
+
+**BUG B: pruning orphaned nodes.** `_keep_nodes` selects nodes, but links need
+BOTH endpoints kept. A node kept on its own merit (endpoint, suspicious, lead)
+whose parent was dropped lost all its edges and rendered as a star connected to
+nothing - reproduced: `0xm149` kept as an endpoint, parent pruned, 1 orphan.
+Fix in `_keep_nodes`: build a best-inbound-parent map (highest amount, strictly
+toward the seed), walk each kept node's ancestors back until it joins the kept
+set, then drop anything still isolated. Bounded at 1.3x MAX_RENDER_NODES so a
+deep chain cannot drag in 12 ancestors per node and blow the render budget.
+Rendered count can now slightly exceed MAX_RENDER_NODES - deliberate: a
+connected graph beats a floating-dot field.
+
+### FOURTH AUDIT (2026-09-08) - the audit record itself, all fixed
+Probed persistence, degenerate inputs, seed normalisation, dedupe-on-copy.
+Clean: 1-node graphs and zero-value edges do not crash the payload or the case
+summary; the in-memory edge dedupe survives `model_copy`; branch/depth handling
+unchanged.
+
+**BUG 11 (HIGH): the saved audit record silently lost evidence.**
+(a) `investigation_edges` PRIMARY KEY was (investigation_id, tx_hash,
+from_address, to_address) - no token or amount. ONE transaction moving two
+tokens between the same pair (a swap, a batch payout) collapsed to a single
+row under INSERT OR REPLACE: proved 2 in-memory edges -> 1 persisted row, the
+USDT leg overwritten by the WETH leg.
+(b) `save_graph` wrote a hardcoded `score = 0.0` and persisted NONE of the
+taint or behaviour fields, so the record held the graph's shape but not its
+conclusions and could not say why any wallet was ranked.
+Fix: `Database._migrate()` - `CREATE TABLE IF NOT EXISTS` does nothing to an
+existing table, so schema corrections need explicit migration. It ALTERs in the
+six analysis columns and rebuilds `investigation_edges` with the token+amount
+key, copying existing rows across. `save_graph` now writes taint_fraction,
+taint_token, taint_by_token, behavior, behavior_confidence, behavior_signals.
+
+**BUG 12 (MEDIUM): `propagate_taint` silently no-opped on a seed mismatch.**
+A seed missing from its own graph returned {} and left every wallet at taint 0
+- an empty ranking with nothing to explain it. Now raises ValueError. The one
+caller always inserts the seed first, so this is unreachable in normal flow;
+it exists to make a normalisation bug loud. `test_unknown_seed_is_safe` pinned
+the old silent behaviour and was rewritten - the old contract was the bug.
+
+NOTE: `save_graph` still has no `load_graph`. Persistence is write-only by
+design (audit record, never a traversal source - see the earlier stale-cache
+fix). Fine, but it means the saved record is not yet reloadable in the UI.
+
+Tests: 99 pass (2 new in TestAuditRecord).
+
+---
+
+## CURRENT STATE (2026-09-08, end of session)
+
+**Tests: 99 passing.** Last commit `feac040 "Forensic Mode"`. 13 files modified
+and UNCOMMITTED at this point: the third/fourth audit fixes, dust handling,
+the two trace modes, and the payload/amount fixes.
+
+**Shipped this session**
+- Per-token taint; two trace modes (FORENSIC / ACTIVITY); dust + address-
+  poisoning detection and exclusion; confidence-coloured suspect nodes; the
+  23-wallet demo case; honest FAILED / PARTIAL status; schema migration for the
+  audit record.
+- 12 bugs found and fixed across four audits (see the four audit sections
+  above for the full list and mechanisms).
+
+**Open items**
+1. Real Tron/ETH entity label datasets (OPUS_BRIEF item #1) - data sourcing,
+   deliberately not hand-written.
+2. `save_graph` has no `load_graph`: a saved case cannot be reopened in the UI.
+   Write-only is deliberate (never a traversal source) but reloading for review
+   is a genuine gap.
+3. Freeze-request draft: the SIH deck claims it; only a report + JSON export
+   exist.
+4. The 1e9 scam-token cap is crude - stops uint256-max tokens, not a 100M-unit
+   scam token. Per-token taint contains the blast radius, so lower priority.
+5. Deck corrections still to apply: clustering (common-input / change-address)
+   is NOT built and cannot be on account-based chains; no Bitcoin; NetworkX not
+   Neo4j; Streamlit + SQLite, not FastAPI + Postgres; Etherscan V2 / BscScan /
+   TronGrid, not Blockchair.
+
+**Hard-won gotchas (do not relearn)**
+- Streamlit does NOT hot-reload imported modules. Fully restart the server.
+- TronGrid rate-limits under repeated runs and returns an EMPTY graph, which
+  looks exactly like a detector that failed to fire. Always print node/edge
+  counts in probe scripts.
+- Do not patch `time.monotonic` to force a budget timeout: asyncio's event loop
+  reads the same clock. Set the budget negative instead.
+- `Graph.graphData(DATA)` must be called BEFORE any `Graph.d3Force(...)`.
+- force-graph's `zoomToFit` tween must be shorter than the re-fit interval or
+  it never reaches its target.

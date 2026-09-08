@@ -119,7 +119,8 @@ class Database:
                     is_highlighted INTEGER DEFAULT 0,
                     is_suspicious INTEGER DEFAULT 0,
                     path_rank INTEGER,
-                    PRIMARY KEY (investigation_id, tx_hash, from_address, to_address),
+                    PRIMARY KEY (investigation_id, tx_hash, from_address, to_address,
+                                 token_symbol, amount),
                     FOREIGN KEY (investigation_id) REFERENCES investigations(investigation_id)
                 );
 
@@ -143,6 +144,67 @@ class Database:
                     FOREIGN KEY (investigation_id) REFERENCES investigations(investigation_id)
                 );
             """)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Bring an existing database up to the current schema.
+
+        CREATE TABLE IF NOT EXISTS does nothing to a table that already exists,
+        so schema corrections need explicit migration or old databases keep the
+        old, broken behaviour.
+        """
+        with self.connection() as conn:
+            # 1. analysis columns on nodes. The audit record used to store a
+            # hardcoded score of 0.0 and none of the taint or behaviour fields,
+            # so it recorded the graph but not the conclusions - it could not
+            # explain why any wallet was ranked.
+            have = {r["name"] for r in conn.execute(
+                "PRAGMA table_info(investigation_nodes)"
+            )}
+            for col, decl in (
+                ("taint_fraction", "REAL DEFAULT 0"),
+                ("taint_token", "TEXT"),
+                ("taint_by_token", "TEXT"),
+                ("behavior", "TEXT"),
+                ("behavior_confidence", "REAL DEFAULT 0"),
+                ("behavior_signals", "TEXT"),
+            ):
+                if col not in have:
+                    conn.execute(
+                        f"ALTER TABLE investigation_nodes ADD COLUMN {col} {decl}"
+                    )
+
+            # 2. edges primary key. It omitted token_symbol and amount, so one
+            # transaction moving two tokens between the same pair (a swap, a
+            # batch payout) collapsed to a single row and the audit record
+            # silently lost a leg of the transfer.
+            sql = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' "
+                "AND name='investigation_edges'"
+            ).fetchone()
+            if sql and "token_symbol" not in sql["sql"].split("PRIMARY KEY")[-1]:
+                conn.executescript("""
+                    ALTER TABLE investigation_edges RENAME TO investigation_edges_old;
+                    CREATE TABLE investigation_edges (
+                        investigation_id TEXT NOT NULL,
+                        tx_hash TEXT NOT NULL,
+                        from_address TEXT NOT NULL,
+                        to_address TEXT NOT NULL,
+                        chain TEXT NOT NULL,
+                        token_contract TEXT,
+                        token_symbol TEXT,
+                        amount TEXT NOT NULL,
+                        timestamp INTEGER NOT NULL,
+                        is_highlighted INTEGER DEFAULT 0,
+                        is_suspicious INTEGER DEFAULT 0,
+                        path_rank INTEGER,
+                        PRIMARY KEY (investigation_id, tx_hash, from_address,
+                                     to_address, token_symbol, amount)
+                    );
+                    INSERT OR REPLACE INTO investigation_edges
+                        SELECT * FROM investigation_edges_old;
+                    DROP TABLE investigation_edges_old;
+                """)
 
     def execute(self, query: str, params: tuple = ()) -> sqlite3.Cursor:
         with self.connection() as conn:

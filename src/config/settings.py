@@ -49,6 +49,20 @@ class Settings(BaseSettings):
         ge=5,
         description="Hard timeout for one address's provider fetch (all pages)",
     )
+    dust_amount_threshold: float = Field(
+        default=0.001,
+        gt=0,
+        description="Transfers below this many token units are dust. They are "
+        "kept as edges (an address-poisoning spray is evidence of targeting) "
+        "but their recipients are never expanded - following thousands of "
+        "1-sun sends exhausts the branch limit and the time budget.",
+    )
+    poisoning_min_dust_sends: int = Field(
+        default=15,
+        ge=2,
+        description="Dust sends from one wallet before address poisoning is "
+        "considered",
+    )
     max_plausible_transfer_amount: float = Field(
         default=1e9,
         gt=0,

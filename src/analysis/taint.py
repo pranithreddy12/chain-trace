@@ -50,7 +50,14 @@ def propagate_taint(
     transfers. Other tokens are anchored on the seed's own outflow in them.
     """
     if seed_addr not in graph.nodes:
-        return {}
+        # Silently returning {} left every wallet at taint 0 and every ranking
+        # empty, with nothing to say why - the same class of silent failure as
+        # a swallowed fetch error. A seed that is not in its own graph is a
+        # normalisation bug, so make it loud.
+        raise ValueError(
+            f"seed {seed_addr!r} is not a node in its own graph "
+            f"({len(graph.nodes)} nodes); address normalisation mismatch"
+        )
 
     out_edges: Dict[str, Dict[str, List[GraphEdge]]] = defaultdict(
         lambda: defaultdict(list)

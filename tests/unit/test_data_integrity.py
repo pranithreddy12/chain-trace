@@ -390,3 +390,212 @@ class TestTraceModes:
 
         sig = inspect.signature(InvestigationService.run_investigation)
         assert sig.parameters["mode"].default == TraceMode.FORENSIC
+
+
+class TestAddressPoisoning:
+    """Dust sprayed at lookalike addresses is spam, not fund movement."""
+
+    def _graph_with_spray(self, n_dust=20, include_lookalike=True):
+        g = TransactionGraph(seed_address="0xseed")
+        _node(g, "0xseed", 0, seed=True)
+        genuine = "0xabcd111111111111111111111111111111119999"
+        _node(g, genuine, 1)
+        _edge(g, "0xseed", genuine, 500)  # a real payment
+        for i in range(n_dust):
+            if include_lookalike and i == 0:
+                # same first-4 and last-4 as the genuine counterparty
+                target = "0xabcd" + f"{i:0>31}" + "9999"
+            else:
+                target = f"0xdead{i:0>35}"
+            _node(g, target, 1)
+            _edge(g, "0xseed", target, 0.000001, minutes=i % 3)
+        return g
+
+    def test_spray_with_a_lookalike_is_detected(self):
+        from src.analysis.pattern_detector import PatternDetector
+
+        d = PatternDetector().detect_address_poisoning(self._graph_with_spray())
+        assert d, "a dust spray with a lookalike must be flagged"
+        assert d[0]["lookalike_pairs"], "the lookalike pair must be reported"
+
+    def test_small_number_of_dust_sends_is_not_flagged(self):
+        from src.analysis.pattern_detector import PatternDetector
+
+        d = PatternDetector().detect_address_poisoning(
+            self._graph_with_spray(n_dust=3)
+        )
+        assert d == [], "a few dust sends are too common to assert on"
+
+    def test_real_payments_are_never_flagged_as_dust(self):
+        from src.analysis.pattern_detector import PatternDetector
+
+        g = TransactionGraph(seed_address="0xseed")
+        _node(g, "0xseed", 0, seed=True)
+        for i in range(30):
+            t = f"0xaaaa{i:0>35}"
+            _node(g, t, 1)
+            _edge(g, "0xseed", t, 100)
+        assert PatternDetector().detect_address_poisoning(g) == []
+
+    def test_lookalike_matcher(self):
+        from src.analysis.pattern_detector import _looks_like
+
+        assert _looks_like("0xabcd0000000000000000000000000000009999",
+                           "0xabcd1111111111111111111111111111119999")
+        assert not _looks_like("0xabcd0000000000000000000000000000009999",
+                               "0xzzzz1111111111111111111111111111110000")
+
+    def test_dust_recipients_are_not_expanded(self):
+        """The whole point: a spray must not eat the branch budget."""
+        import asyncio
+        from unittest.mock import Mock, AsyncMock, patch
+        from src.application.trace_service import TraceEngine
+
+        dust = [_transfer("0xseed", f"0xdead{i:0>35}", 0.000001) for i in range(30)]
+        real = [_transfer("0xseed", "0xreal", 500)]
+
+        p = Mock()
+        p.chain = Chain.ETHEREUM
+        p.truncated_addresses = set()
+
+        async def fetch(address, **kw):
+            if address.lower() == "0xseed":
+                return dust + real
+            if address.lower() == "0xreal":
+                return [_transfer("0xreal", "0xnext", 400)]
+            raise AssertionError(f"expanded a dust recipient: {address}")
+
+        p.get_all_outgoing_transfers = fetch
+        p.close = AsyncMock()
+        e = TraceEngine()
+        with patch.object(e, "_get_provider", return_value=p):
+            r = asyncio.run(
+                e.trace("0xseed", Chain.ETHEREUM, max_depth=3, max_branches=5)
+            )
+        # dust edges are kept as evidence...
+        assert len(r.graph.edges) >= 31
+        # ...but the real path was still followed despite 30 dust sends
+        assert "0xnext" in r.graph.nodes
+
+
+class TestRenderPayload:
+    """The picture must match the data: real amounts, no floating stars."""
+
+    def _chain_graph(self, n=150):
+        import types
+        from src.domain.models.address import Address
+
+        g = TransactionGraph(seed_address="0xseed")
+        _node(g, "0xseed", 0, seed=True)
+        for i in range(n):
+            _node(g, f"0xm{i}", 1 + i)
+        for i in range(n):
+            src = "0xseed" if i == 0 else f"0xm{i-1}"
+            _edge(g, src, f"0xm{i}", 1.0, minutes=i)
+        g.nodes[f"0xm{n-1}"].is_endpoint = True
+        return types.SimpleNamespace(
+            graph=g,
+            case_summary={},
+            pattern_detections={},
+            seed_address=Address(address="0xseed", chain=Chain.ETHEREUM),
+        )
+
+    def test_pruning_never_leaves_a_node_without_edges(self):
+        import graph_view
+
+        payload = graph_view._build_payload(self._chain_graph(), None)
+        linked = set()
+        for l in payload["links"]:
+            linked.add(l["source"])
+            linked.add(l["target"])
+        orphans = [
+            n["id"] for n in payload["nodes"]
+            if n["id"] not in linked and n["id"] != "0xseed"
+        ]
+        assert orphans == [], f"floating nodes rendered: {orphans[:5]}"
+
+    def test_pruning_stays_bounded(self):
+        import graph_view
+
+        payload = graph_view._build_payload(self._chain_graph(400), None)
+        assert len(payload["nodes"]) <= int(graph_view.MAX_RENDER_NODES * 1.3) + 1
+
+    def test_activity_mode_records_node_amounts(self):
+        import asyncio
+        from unittest.mock import Mock, AsyncMock, patch
+        from src.application.investigation_service import InvestigationService
+        from src.domain.enums import TraceMode
+
+        every = {
+            "0xseed": [_transfer("0xseed", "0xa", 100)],
+            "0xa": [_transfer("0xa", "0xb", 90, minutes=5)],
+            "0xb": [],
+        }
+        p = Mock()
+        p.chain = Chain.ETHEREUM
+        p.truncated_addresses = set()
+
+        async def both(a, **kw):
+            return list(every.get(a.lower(), []))
+
+        async def out(a, **kw):
+            return [t for t in every.get(a.lower(), []) if t.normalized_from() == a.lower()]
+
+        p.get_all_transfers = both
+        p.get_all_outgoing_transfers = out
+        p.close = AsyncMock()
+
+        svc = InvestigationService()
+        with patch.object(svc.trace_engine, "_get_provider", return_value=p):
+            r = asyncio.run(
+                svc.run_investigation(
+                    "0xseed", Chain.ETHEREUM, max_depth=2, max_branches=25,
+                    mode=TraceMode.ACTIVITY,
+                )
+            )
+        assert float(r.graph.nodes["0xseed"].outgoing_amount) == 100.0
+        assert float(r.graph.nodes["0xa"].incoming_amount) == 100.0
+
+
+class TestAuditRecord:
+    """The saved case must survive as evidence, not just as a shape."""
+
+    def _saved(self, graph, inv_id):
+        from src.persistence.repositories import InvestigationRepository
+        from src.persistence.database import Database
+
+        InvestigationRepository().save_graph(inv_id, graph)
+        db = Database()
+        edges = db.fetch_all(
+            "SELECT tx_hash, token_symbol, amount FROM investigation_edges "
+            "WHERE investigation_id=?", (inv_id,)
+        )
+        nodes = db.fetch_all(
+            "SELECT address, taint_fraction, taint_token FROM investigation_nodes "
+            "WHERE investigation_id=?", (inv_id,)
+        )
+        db.execute("DELETE FROM investigation_edges WHERE investigation_id=?", (inv_id,))
+        db.execute("DELETE FROM investigation_nodes WHERE investigation_id=?", (inv_id,))
+        return edges, nodes
+
+    def _two_token_graph(self):
+        g = TransactionGraph(seed_address="0xseed")
+        _node(g, "0xseed", 0, seed=True)
+        _node(g, "0xa", 1)
+        # ONE transaction moving two tokens between the same pair - a swap or
+        # batch payout. Both legs are real and both must be recorded.
+        _edge(g, "0xseed", "0xa", 100, "USDT", tx="0xONETX")
+        _edge(g, "0xseed", "0xa", 5, "WETH", tx="0xONETX")
+        propagate_taint(g, "0xseed")
+        return g
+
+    def test_same_hash_different_token_keeps_both_legs(self):
+        edges, _ = self._saved(self._two_token_graph(), "test-audit-edges")
+        assert len(edges) == 2, "a leg of the transfer was overwritten"
+        assert {e["token_symbol"] for e in edges} == {"USDT", "WETH"}
+
+    def test_taint_is_persisted_with_the_node(self):
+        _, nodes = self._saved(self._two_token_graph(), "test-audit-nodes")
+        row = next(n for n in nodes if n["address"] == "0xa")
+        assert row["taint_fraction"] == 1.0
+        assert row["taint_token"] in ("USDT", "WETH")

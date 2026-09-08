@@ -110,6 +110,44 @@ def _keep_nodes(result, highlighted_path):
         if len(keep) >= MAX_RENDER_NODES:
             break
         keep.add(nid)
+
+    # Keeping a node without the wallets it received from leaves it floating in
+    # the render with no visible connection - a star that appears related to
+    # nothing. Pull in each kept node's strongest inbound chain back toward the
+    # seed so what is drawn is actually a graph.
+    best_parent = {}
+    for e in graph.edges:
+        f, t = e.transfer.normalized_from(), e.transfer.normalized_to()
+        if f not in graph.nodes or t not in graph.nodes or f == t:
+            continue
+        if graph.nodes[f].depth >= graph.nodes[t].depth:
+            continue  # only walk back toward the seed
+        cur = best_parent.get(t)
+        if cur is None or e.transfer.amount_float > cur[1]:
+            best_parent[t] = (f, e.transfer.amount_float)
+
+    # Bounded: a deep chain could otherwise drag in 12 ancestors per kept node
+    # and blow the render budget the cap exists to protect.
+    ceiling = int(MAX_RENDER_NODES * 1.3)
+    for nid in list(keep):
+        hops = 0
+        cur = nid
+        while hops < 12 and len(keep) < ceiling:
+            parent = best_parent.get(cur)
+            if parent is None or parent[0] in keep:
+                break
+            keep.add(parent[0])
+            cur = parent[0]
+            hops += 1
+
+    # anything still isolated genuinely has no traced link to the rest
+    linked = set()
+    for e in graph.edges:
+        f, t = e.transfer.normalized_from(), e.transfer.normalized_to()
+        if f in keep and t in keep and f != t:
+            linked.add(f)
+            linked.add(t)
+    keep = {n for n in keep if n in linked or n == graph.seed_address}
     return keep, True
 
 

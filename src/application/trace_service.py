@@ -48,6 +48,7 @@ class TraceContext:
     # the trail was cut short by our own limits (time budget, provider page
     # cap) rather than by running out of chain
     truncated: bool = False
+    dust_edges: int = 0
     # A bare class attribute here is evaluated ONCE at import and shared by
     # every context, so it silently kept stale config (time budget, scam cap,
     # fetch timeout) whenever settings were reloaded - a real hazard under
@@ -243,15 +244,24 @@ class TraceEngine:
         ctx.visited.add(address)
 
         seen = set()
+        dust_only = set()
         for transfer in transfers:
             frm, to = transfer.normalized_from(), transfer.normalized_to()
             other = to if frm == address else frm
             if other == address:
                 continue  # self-transfer: an edge, but not a counterparty
-            seen.add(other)
+            if transfer.amount_float < ctx.settings.dust_amount_threshold:
+                ctx.dust_edges += 1
+                dust_only.add(other)
+            else:
+                seen.add(other)
+                dust_only.discard(other)
             if other not in ctx.graph.nodes:
                 await self._get_or_create_address(ctx, other, depth + 1)
+            self._record_amounts(ctx, transfer)
             ctx.graph.add_edge(GraphEdge(transfer=transfer))
+        # a counterparty reached ONLY by dust is spam, not a relationship worth
+        # spending a full paginated fetch on
         return seen
 
     async def _bfs_trace(
@@ -295,7 +305,11 @@ class TraceEngine:
                 to_address = transfer.normalized_to()
                 is_new_node = to_address not in ctx.graph.nodes
 
-                if is_new_node and new_nodes >= max_branches:
+                if (
+                    is_new_node
+                    and new_nodes >= max_branches
+                    and transfer.amount_float >= ctx.settings.dust_amount_threshold
+                ):
                     if not limit_hit:
                         ctx.investigation.warnings.append(
                             f"Branch limit ({max_branches}) reached at depth {depth} "
@@ -304,8 +318,18 @@ class TraceEngine:
                         limit_hit = True
                     continue
 
+                # Dust (address-poisoning spray) still becomes an edge - the
+                # spray is evidence that this wallet was targeted - but its
+                # recipients are never followed: thousands of 1-sun sends would
+                # eat the branch limit and the time budget and bury the real
+                # money path.
+                is_dust = transfer.amount_float < ctx.settings.dust_amount_threshold
+                if is_dust:
+                    ctx.dust_edges += 1
                 enqueue = (
-                    to_address not in ctx.visited and depth + 1 < max_depth
+                    to_address not in ctx.visited
+                    and depth + 1 < max_depth
+                    and not is_dust
                 )
                 await self._process_transfer(
                     ctx, transfer, depth, to_address, enqueue=enqueue
@@ -313,7 +337,7 @@ class TraceEngine:
                 if enqueue:
                     # money can only leave a wallet AFTER it arrived there
                     ctx.queue[-1] = (to_address, depth + 1, transfer.timestamp)
-                if is_new_node:
+                if is_new_node and not is_dust:
                     new_nodes += 1
 
     async def _get_transfers(
@@ -435,6 +459,29 @@ class TraceEngine:
             )
             return []
 
+    def _record_amounts(self, ctx: TraceContext, transfer: Transfer) -> None:
+        """Roll one transfer into both endpoints' running totals.
+
+        Every path that adds an edge must go through here. Activity mode used
+        to add edges directly and skipped this, so every node reported
+        "in 0 / out 0" and the graph's size/pruning ranking was meaningless.
+        """
+        frm = ctx.graph.get_node(transfer.normalized_from())
+        to = ctx.graph.get_node(transfer.normalized_to())
+
+        if frm:
+            frm.outgoing_amount = str(
+                float(frm.outgoing_amount) + transfer.amount_float
+            )
+            frm.first_seen = min(frm.first_seen or transfer.timestamp, transfer.timestamp)
+            frm.last_seen = transfer.timestamp
+        if to:
+            to.incoming_amount = str(
+                float(to.incoming_amount) + transfer.amount_float
+            )
+            to.first_seen = min(to.first_seen or transfer.timestamp, transfer.timestamp)
+            to.last_seen = transfer.timestamp
+
     async def _process_transfer(
         self,
         ctx: TraceContext,
@@ -443,25 +490,9 @@ class TraceEngine:
         to_address: str,
         enqueue: bool = True,
     ) -> None:
-        to_addr_obj = await self._get_or_create_address(ctx, to_address, depth + 1)
-        from_addr_obj = ctx.graph.get_node(transfer.normalized_from())
-
-        if from_addr_obj:
-            from_addr_obj.outgoing_amount = str(
-                float(from_addr_obj.outgoing_amount) + transfer.amount_float
-            )
-            from_addr_obj.last_seen = transfer.timestamp
-
-        to_addr_obj.incoming_amount = str(
-            float(to_addr_obj.incoming_amount) + transfer.amount_float
-        )
-        to_addr_obj.first_seen = min(
-            to_addr_obj.first_seen or transfer.timestamp, transfer.timestamp
-        )
-        to_addr_obj.last_seen = transfer.timestamp
-
-        edge = GraphEdge(transfer=transfer)
-        ctx.graph.add_edge(edge)
+        await self._get_or_create_address(ctx, to_address, depth + 1)
+        self._record_amounts(ctx, transfer)
+        ctx.graph.add_edge(GraphEdge(transfer=transfer))
 
         if enqueue:
             ctx.visited.add(to_address)

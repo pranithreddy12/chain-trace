@@ -340,6 +340,7 @@ def render_transactions_table(result):
                 "From": f,
                 "To": tr.normalized_to(),
                 "Amount": tr.amount_float,
+                "Dust": tr.amount_float < 0.001,
                 "Token": tr.token_symbol or "-",
                 "Tx Hash": tr.transaction_hash,
                 "On Path": bool(
@@ -357,11 +358,24 @@ def render_transactions_table(result):
         tokens = sorted(t for t in df["Token"].unique())
         pick = st.multiselect("Token", tokens, default=tokens)
     with c2:
-        min_amt = st.number_input("Min amount", min_value=0.0, value=0.0, step=1.0)
+        min_amt = st.number_input(
+            "Min amount", min_value=0.0, value=0.0, step=1.0, format="%.6f"
+        )
+        n_dust = int(df["Dust"].sum())
+        hide_dust = st.checkbox(
+            f"Hide dust ({n_dust})",
+            value=False,
+            disabled=n_dust == 0,
+            help="Address-poisoning spam sprays thousands of ~0.000001 "
+            "transfers to lookalike addresses. Hidden here, never deleted - "
+            "the spray itself is evidence.",
+        )
     with c3:
         search = st.text_input("Address contains", placeholder="paste an address fragment")
 
     view = df[df["Token"].isin(pick) & (df["Amount"] >= min_amt)]
+    if hide_dust:
+        view = view[~view["Dust"]]
     if search:
         s = search.strip().lower()
         view = view[
@@ -379,7 +393,14 @@ def render_transactions_table(result):
         hide_index=True,
         column_config={
             "Date": st.column_config.DatetimeColumn(format="YYYY-MM-DD HH:mm"),
-            "Amount": st.column_config.NumberColumn(format="%.4f"),
+            # %.4f rendered 1-sun dust (0.000001 TRX) as a flat "0.0000",
+            # which reads as a zero-value transfer. TRX and Tron-USDT both
+            # carry 6 decimals, so show all of them.
+            "Amount": st.column_config.NumberColumn(format="%.6f"),
+            "Dust": st.column_config.CheckboxColumn(
+                help="Below 0.001 units - typically address-poisoning "
+                     "spam, not a real payment",
+            ),
             "From": st.column_config.TextColumn(width="medium"),
             "To": st.column_config.TextColumn(width="medium"),
             "Tx Hash": st.column_config.TextColumn(width="medium"),

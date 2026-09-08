@@ -18,6 +18,10 @@ BURST_MIN_RECIPIENTS = 6
 BURST_WINDOW_SECONDS = 3600
 
 
+def _sh(a: str) -> str:
+    return f"{a[:8]}...{a[-6:]}" if len(a) > 18 else a
+
+
 def _fmt_amt(x: float) -> str:
     return f"{x:,.2f}"
 
@@ -85,6 +89,46 @@ def build_case_summary(result: InvestigationResult) -> Dict[str, Any]:
                 ),
                 "addresses": [seed_norm],
                 "metrics": {"primary_token": primary, "other_tokens": others},
+            }
+        )
+
+    # ---- 0b. address poisoning ------------------------------------------
+    for d in result.pattern_detections.get("address_poisoning", []):
+        pairs = d.get("lookalike_pairs", [])
+        if pairs:
+            verdict = (
+                f"This is address poisoning: {pairs[0]['impostor']} imitates "
+                f"{pairs[0]['impersonates']}, so that someone copying an "
+                f"address out of their history sends funds to the impostor."
+            )
+        else:
+            # no lookalike found - do not assert intent we have not evidenced
+            verdict = (
+                "No impersonated address was found inside this case, so the "
+                "intent is unconfirmed: this is consistent with address "
+                "poisoning or with airdrop spam."
+            )
+        findings.append(
+            {
+                "severity": "high" if pairs else "medium",
+                "type": "address_poisoning",
+                "title": f"Dust spray from {_sh(d['address'])} "
+                         f"({d['dust_targets']} addresses)",
+                "detail": (
+                    "; ".join(d["signals"])
+                    + ". "
+                    + verdict
+                    + " The recipients are NOT counterparties of this wallet "
+                    "and were not traced further; the spray is kept as "
+                    "evidence that the wallet was involved in it."
+                ),
+                "addresses": [d["address"]],
+                "metrics": {
+                    "dust_targets": d["dust_targets"],
+                    "lookalike_pairs": pairs,
+                    "burst_seconds": d["burst_seconds"],
+                    "uniform_amount": d.get("uniform_amount"),
+                },
             }
         )
 

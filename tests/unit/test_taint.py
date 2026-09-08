@@ -113,9 +113,17 @@ class TestPropagateTaint:
         assert g.nodes["b"].taint_fraction == pytest.approx(0.95)
         assert g.nodes["b"].tainted_value == pytest.approx(47.5)
 
-    def test_unknown_seed_is_safe(self):
+    def test_unknown_seed_raises_instead_of_silently_zeroing(self):
+        """A seed missing from its own graph is a normalisation bug.
+
+        This used to return {} and leave every wallet at taint 0, producing an
+        empty ranking with nothing to explain it.
+        """
+        import pytest
+
         g = _chain_graph()
-        assert propagate_taint(g, "nope") == {}
+        with pytest.raises(ValueError, match="not a node in its own graph"):
+            propagate_taint(g, "nope")
 
 
 class TestDominantPath:

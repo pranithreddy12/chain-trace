@@ -8,6 +8,25 @@ from ..domain.enums import PatternType
 from ..config.settings import get_settings
 
 
+def _dur_s(secs: float) -> str:
+    secs = int(secs)
+    if secs < 120:
+        return f"{secs}s"
+    if secs < 7200:
+        return f"{secs // 60}m"
+    return f"{secs // 3600}h"
+
+
+def _looks_like(candidate: str, genuine: str, edge_chars: int = 4) -> bool:
+    """Two addresses a human would confuse when glancing at a truncated form."""
+    if len(candidate) < edge_chars * 2 or len(genuine) < edge_chars * 2:
+        return False
+    return (
+        candidate[:edge_chars].lower() == genuine[:edge_chars].lower()
+        and candidate[-edge_chars:].lower() == genuine[-edge_chars:].lower()
+    )
+
+
 class PatternDetector:
     def __init__(self):
         self.settings = get_settings()
@@ -19,7 +38,92 @@ class PatternDetector:
             PatternType.MICRO_FAN_OUT.value: self.detect_micro_fan_out(graph),
             PatternType.RAPID_MULTI_HOP.value: self.detect_rapid_multi_hop(graph),
             PatternType.PEEL_BEHAVIOR.value: self.detect_peel_behavior(graph),
+            PatternType.ADDRESS_POISONING.value: self.detect_address_poisoning(graph),
         }
+
+    def detect_address_poisoning(
+        self, graph: TransactionGraph
+    ) -> List[Dict[str, Any]]:
+        """Dust sprayed at many lookalike addresses.
+
+        The scam: send a worthless amount from an address crafted to share its
+        first and last characters with one the victim really uses, so the
+        victim later copies the poisoned address out of their history and sends
+        real funds to it.
+
+        Requires two independent signals (spec 18): a burst of dust to many
+        distinct recipients, AND at least one of those recipients being a
+        lookalike of a genuine counterparty. Volume alone is not enough - a
+        legitimate airdrop also sprays.
+        """
+        cfg = get_settings()
+        dust_to: Dict[str, set] = defaultdict(set)
+        dust_times: Dict[str, List[Any]] = defaultdict(list)
+        dust_amounts: Dict[str, List[str]] = defaultdict(list)
+        all_genuine: set = set()
+
+        for edge in graph.edges:
+            frm = edge.transfer.normalized_from()
+            to = edge.transfer.normalized_to()
+            if edge.transfer.amount_float < cfg.dust_amount_threshold:
+                dust_to[frm].add(to)
+                dust_times[frm].append(edge.transfer.timestamp)
+                dust_amounts[frm].append(edge.transfer.amount)
+            else:
+                all_genuine.add(frm)
+                all_genuine.add(to)
+
+        detections = []
+        for addr, targets in dust_to.items():
+            if len(targets) < cfg.poisoning_min_dust_sends:
+                continue
+
+            # The lookalike test compares against every genuine address in the
+            # case, not just this wallet's own counterparties: the address being
+            # impersonated usually belongs to the victim, not to the sprayer.
+            lookalikes = [
+                (t, g)
+                for t in targets
+                for g in all_genuine
+                if t != g and _looks_like(t, g)
+            ]
+
+            times = sorted(x for x in dust_times[addr] if x)
+            span = (times[-1] - times[0]).total_seconds() if len(times) > 1 else 0.0
+            amounts = dust_amounts[addr]
+            uniform = len(set(amounts)) == 1 and len(amounts) > 1
+
+            signals = [f"{len(targets)} dust transfers to distinct addresses"]
+            if lookalikes:
+                signals.append(
+                    f"{len(lookalikes)} of them impersonate a real address in "
+                    f"this case (same leading and trailing characters)"
+                )
+            if uniform:
+                # a spray is scripted: every send is the same token-dust amount.
+                # Real payments to hundreds of parties are not byte-identical.
+                signals.append(
+                    f"every send is exactly {amounts[0]} - a scripted spray, "
+                    f"not payments"
+                )
+            if len(times) > 1 and span <= 86400:
+                signals.append(f"all sent within {_dur_s(span)}")
+            if len(signals) < 2:
+                continue
+
+            detections.append(
+                {
+                    "address": addr,
+                    "dust_targets": len(targets),
+                    "lookalike_pairs": [
+                        {"impostor": a, "impersonates": b} for a, b in lookalikes[:5]
+                    ],
+                    "burst_seconds": round(span, 1),
+                    "uniform_amount": amounts[0] if uniform else None,
+                    "signals": signals,
+                }
+            )
+        return detections
 
     def detect_fan_out(self, graph: TransactionGraph) -> List[Dict[str, Any]]:
         detections = []

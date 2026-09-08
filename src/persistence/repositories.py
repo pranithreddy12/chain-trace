@@ -244,8 +244,10 @@ class InvestigationRepository:
                 INSERT OR REPLACE INTO investigation_nodes
                 (investigation_id, address, chain, depth, node_type, score,
                  incoming_amount, outgoing_amount, pattern_flags,
-                 is_seed, is_endpoint, is_suspicious, is_obfuscation_point)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 is_seed, is_endpoint, is_suspicious, is_obfuscation_point,
+                 taint_fraction, taint_token, taint_by_token,
+                 behavior, behavior_confidence, behavior_signals)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 (
                     investigation_id,
@@ -253,7 +255,10 @@ class InvestigationRepository:
                     node.address.chain.value,
                     node.depth,
                     node.node_type.value,
-                    0.0,
+                    # the record has to carry the CONCLUSION, not just the shape:
+                    # a saved case that cannot say why a wallet was ranked is not
+                    # an audit record
+                    node.taint_fraction,
                     node.incoming_amount,
                     node.outgoing_amount,
                     json.dumps(node.pattern_flags),
@@ -261,6 +266,12 @@ class InvestigationRepository:
                     1 if node.is_endpoint else 0,
                     1 if node.is_suspicious else 0,
                     1 if node.is_obfuscation_point else 0,
+                    node.taint_fraction,
+                    node.taint_token,
+                    json.dumps(node.taint_by_token),
+                    node.behavior,
+                    node.behavior_confidence,
+                    json.dumps(node.behavior_signals),
                 ),
             )
 

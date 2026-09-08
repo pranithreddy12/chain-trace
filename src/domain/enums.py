@@ -105,6 +105,7 @@ class PatternType(str, Enum):
     MICRO_FAN_OUT = "micro_fan_out"
     RAPID_MULTI_HOP = "rapid_multi_hop"
     PEEL_BEHAVIOR = "peel_behavior"
+    ADDRESS_POISONING = "address_poisoning"
 
 
 class ProviderErrorType(str, Enum):
