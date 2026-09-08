@@ -690,3 +690,42 @@ Streamlit's `st.date_input` produces naive datetimes, so the shipped UI path
 was never affected; this was latent.
 
 Tests: 82 pass (5 new in TestFailuresAreNotFindings).
+
+### THIRD AUDIT (2026-09-08) - silent truncation, all fixed
+Probed pagination caps, time budget, branch limits, config lifetime.
+
+**BUG 7 (HIGH): provider page cap silently truncated history.**
+`get_all_outgoing_transfers(max_pages=5, offset=100)` caps each address at 500
+transfers per type on BOTH TronGrid and Etherscan. Running out of pages was
+indistinguishable from running out of data, so a busy wallet's older history
+was dropped with no signal - and providers return newest-first, so an older
+incident's transfers can fall entirely outside the fetched window.
+Fix: `BlockchainProvider.truncated_addresses`; both providers use for/while
++ `else:` to record the address only when the loop ended on the CAP (a short
+page is not truncation). `trace_service` folds that into the status and warns
+which addresses were cut.
+
+**BUG 8 (MEDIUM): time-budget exhaustion reported as COMPLETED.** The warning
+literally said "results are partial" while the status said completed. Now
+`ctx.truncated` -> `mark_partial`.
+
+**BUG 10 (MEDIUM, found by a failing test): `TraceContext.settings` was a bare
+class attribute** (`settings = get_settings()`), evaluated once at import and
+shared by every context. It silently diverged from `get_settings()` - the test
+proved two live `Settings` objects, one with the mutated budget and one stale
+at the default. Any settings reload left the engine using stale time budget,
+scam cap and fetch timeout, which is a real hazard given Streamlit's
+module-reload semantics (already a documented trap in this project).
+Fix: `settings: Settings = field(default_factory=get_settings)`. Swept the
+codebase - no other class-level bindings; the 8 `self.settings = get_settings()`
+instance bindings are fine.
+
+**BY DESIGN, not a bug:** hitting the branch limit keeps status COMPLETED. It
+is an explicit user setting and is already disclosed in `case_summary`'s
+`limitations`. Making it PARTIAL would mark almost every real trace partial and
+drain the signal from the status.
+
+Testing note: do NOT patch `time.monotonic` to force a budget timeout -
+asyncio's event loop reads the same clock. Set the budget negative instead.
+
+Tests: 85 pass (3 new in TestTruncationIsDisclosed).

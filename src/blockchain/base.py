@@ -29,6 +29,16 @@ class ProviderError(Exception):
 
 
 class BlockchainProvider(ABC):
+    # Addresses whose history was cut off by the page cap. Truncation must be
+    # reported: for a forensics tool, "we fetched the first 500 transfers" and
+    # "this wallet made 500 transfers" are completely different claims, and
+    # silently conflating them hides money.
+    @property
+    def truncated_addresses(self) -> set:
+        if not hasattr(self, "_truncated_addresses"):
+            self._truncated_addresses = set()
+        return self._truncated_addresses
+
     @property
     @abstractmethod
     def chain(self) -> Chain:

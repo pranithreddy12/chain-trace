@@ -277,6 +277,7 @@ class TronGridProvider(BaseProvider):
 
         # TRC20 (USDT etc.) — paginate via TronGrid's opaque fingerprint token
         fp = None
+        exhausted = False
         for _ in range(max_pages):
             token = await self.get_token_transfers(
                 address, page=fp or 1, offset=offset
@@ -287,6 +288,8 @@ class TronGridProvider(BaseProvider):
             fp = getattr(self, "_last_fingerprint", None)
             if not fp or len(token) < offset:
                 break
+        else:
+            exhausted = True  # ran out of pages, not out of data
 
         # Native TRX
         fp = None
@@ -300,5 +303,9 @@ class TronGridProvider(BaseProvider):
             fp = getattr(self, "_last_fingerprint", None)
             if not fp or len(native) < offset:
                 break
+        else:
+            exhausted = True
 
+        if exhausted:
+            self.truncated_addresses.add(address)
         return all_transfers

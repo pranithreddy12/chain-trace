@@ -222,3 +222,89 @@ class TestFailuresAreNotFindings:
         except AttributeError:
             return
         raise AssertionError("programming error was swallowed")
+
+
+class TestTruncationIsDisclosed:
+    """Third audit: a trace cut short by our own limits is not a complete one."""
+
+    def test_page_cap_marks_the_address_truncated(self):
+        import asyncio
+        from unittest.mock import patch
+        from src.blockchain.trongrid import TronGridProvider
+
+        p = TronGridProvider(api_key="x")
+        calls = {"n": 0}
+
+        async def token(address, page=1, offset=100, **kw):
+            calls["n"] += 1
+            p._last_fingerprint = f"fp{calls['n']}"  # always more to fetch
+            return [
+                _transfer(address, f"Td{calls['n']}_{i}", 10)
+                for i in range(offset)
+            ]
+
+        async def native(address, page=1, offset=100, **kw):
+            p._last_fingerprint = None
+            return []
+
+        with patch.object(p, "get_token_transfers", token), \
+             patch.object(p, "get_native_transfers", native):
+            asyncio.run(p.get_all_outgoing_transfers("Tseed"))
+        assert "Tseed" in p.truncated_addresses
+
+    def test_a_short_page_is_not_truncation(self):
+        import asyncio
+        from unittest.mock import patch
+        from src.blockchain.trongrid import TronGridProvider
+
+        p = TronGridProvider(api_key="x")
+
+        async def token(address, page=1, offset=100, **kw):
+            p._last_fingerprint = None
+            return [_transfer(address, "Td1", 10)]
+
+        async def native(address, page=1, offset=100, **kw):
+            p._last_fingerprint = None
+            return []
+
+        with patch.object(p, "get_token_transfers", token), \
+             patch.object(p, "get_native_transfers", native):
+            asyncio.run(p.get_all_outgoing_transfers("Tshort"))
+        assert p.truncated_addresses == set()
+
+    def test_time_budget_exhaustion_marks_partial(self):
+        """Budget set in the past so the first check trips - no clock race.
+
+        (Patching time.monotonic is not an option here: asyncio's event loop
+        reads the same clock.)
+        """
+        import asyncio
+        from unittest.mock import Mock, AsyncMock, patch
+        from src.application.trace_service import TraceEngine
+        from src.config.settings import get_settings
+        from src.domain.enums import InvestigationStatus
+
+        settings = get_settings()
+        original = settings.trace_time_budget_seconds
+        settings.trace_time_budget_seconds = -1_000_000
+        try:
+            p = Mock()
+            p.chain = Chain.ETHEREUM
+            p.truncated_addresses = set()
+
+            async def fetch(address, **kw):
+                if address.lower() == "0xseed":
+                    return [_transfer("0xseed", f"0xd{i}", 10) for i in range(3)]
+                return []
+
+            p.get_all_outgoing_transfers = fetch
+            p.close = AsyncMock()
+            e = TraceEngine()
+            with patch.object(e, "_get_provider", return_value=p):
+                r = asyncio.run(
+                    e.trace("0xseed", Chain.ETHEREUM, max_depth=4, max_branches=10)
+                )
+            assert r.investigation.status == InvestigationStatus.PARTIAL
+            assert any("time budget" in w for w in r.investigation.warnings)
+        finally:
+            settings.trace_time_budget_seconds = original

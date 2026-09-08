@@ -279,5 +279,9 @@ class EtherscanProvider(BaseProvider):
                 break
 
             page += 1
+        else:
+            # loop ended on the page cap, not on a short page: there is more
+            # history we did not fetch
+            self.truncated_addresses.add(address)
 
         return all_transfers

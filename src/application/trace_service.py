@@ -28,7 +28,7 @@ from ..persistence.repositories import (
     AddressRepository,
     InvestigationRepository,
 )
-from ..config.settings import get_settings
+from ..config.settings import Settings, get_settings
 
 
 @dataclass
@@ -44,7 +44,14 @@ class TraceContext:
     # "no funds moved". Count outcomes so the caller can tell them apart.
     fetch_ok: int = 0
     fetch_failed: int = 0
-    settings = get_settings()
+    # the trail was cut short by our own limits (time budget, provider page
+    # cap) rather than by running out of chain
+    truncated: bool = False
+    # A bare class attribute here is evaluated ONCE at import and shared by
+    # every context, so it silently kept stale config (time budget, scam cap,
+    # fetch timeout) whenever settings were reloaded - a real hazard under
+    # Streamlit's module-reload semantics. Resolve it per context instead.
+    settings: Settings = field(default_factory=get_settings)
 
 
 def _naive_utc(dt: Optional[datetime]) -> Optional[datetime]:
@@ -127,6 +134,17 @@ class TraceEngine:
 
         try:
             await self._bfs_trace(ctx, max_depth, max_branches, token_filter)
+            cut = getattr(provider, "truncated_addresses", None)
+            # isinstance, not truthiness: a provider double may expose
+            # anything under that name
+            if isinstance(cut, (set, frozenset, list, tuple)) and cut:
+                ctx.truncated = True
+                ctx.investigation.warnings.append(
+                    f"Hit the provider page limit on {len(cut)} address(es) "
+                    f"({', '.join(sorted(a[:12] for a in list(cut)[:5]))}"
+                    f"{'...' if len(cut) > 5 else ''}); their older history was "
+                    f"not fetched and funds may have moved in it"
+                )
             if ctx.fetch_failed and not ctx.fetch_ok:
                 # Every lookup failed: the empty graph is our failure, not a
                 # finding about this wallet. Never let that read as "no funds
@@ -141,6 +159,13 @@ class TraceEngine:
                     f"{ctx.fetch_failed} of "
                     f"{ctx.fetch_ok + ctx.fetch_failed} address lookup(s) "
                     f"failed; the trail below is incomplete.",
+                    graph,
+                )
+            elif ctx.truncated:
+                investigation.mark_partial(
+                    "The trace stopped at a configured limit (time budget or "
+                    "provider page cap), not at the end of the trail. See the "
+                    "data quality notes for what was cut.",
                     graph,
                 )
             else:
@@ -177,6 +202,7 @@ class TraceEngine:
                     f"Trace time budget ({ctx.settings.trace_time_budget_seconds}s) "
                     f"reached - results are partial ({len(ctx.queue)} addresses not expanded)"
                 )
+                ctx.truncated = True
                 break
 
             current_address, depth, not_before = ctx.queue.popleft()
