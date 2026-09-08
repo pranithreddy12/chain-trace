@@ -587,6 +587,27 @@ def main():
 
     if st.session_state.investigation_result:
         result = st.session_state.investigation_result
+
+        # A failed or partial trace must never be read as a finding about the
+        # wallet. Say so before anything else on the page.
+        inv_status = result.investigation.status
+        if inv_status == InvestigationStatus.FAILED:
+            st.error(
+                f"**Trace failed - the results below are not evidence.** "
+                f"{result.investigation.error}"
+            )
+        elif inv_status == InvestigationStatus.PARTIAL:
+            st.warning(
+                f"**Incomplete trace.** {result.investigation.error} "
+                f"Wallets that could not be fetched may hide further hops, so "
+                f"absence of a lead here is not absence of one on-chain."
+            )
+        if result.investigation.warnings:
+            with st.expander(
+                f"Data quality notes ({len(result.investigation.warnings)})"
+            ):
+                for w in result.investigation.warnings:
+                    st.markdown(f"- {w}")
         if st.session_state.get("is_demo"):
             st.info(
                 "**Demo case - fabricated data.** A 250,000 USDT theft laundered "

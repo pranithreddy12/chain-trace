@@ -662,3 +662,31 @@ from the scam-token cap, so provider data problems are no longer invisible.
 Verified: 77 tests pass (10 new in `tests/unit/test_data_integrity.py`); demo
 ground truth unchanged; live Tron trace now reports every taint with its token
 and raises the multi-token finding.
+
+### SECOND AUDIT (2026-09-08) - failure reporting, all fixed
+Probed service reuse, cycles, branch limits, timezones, address casing,
+pruning. Clean: investigations are isolated across runs on a reused service;
+cycles (money returning to the seed) terminate correctly; the branch limit
+keeps the LARGEST transfers; EVM addresses normalise to lowercase everywhere;
+`_keep_nodes` always keeps the highlighted path.
+
+**BUG 5 (HIGH): a total provider failure was reported as COMPLETED.** If every
+address lookup threw, the trace returned a 1-node graph with status COMPLETED
+and one warning buried in a list - indistinguishable from "this wallet never
+moved funds". For a forensics tool that is the worst failure mode: a false
+negative presented as a finding. `TraceContext` now counts `fetch_ok` /
+`fetch_failed`; all-failed -> `mark_failed` with explicit "This is NOT evidence
+that the wallet is inactive"; some-failed -> `mark_partial`. The Streamlit app
+shows an error/warning banner above the results plus a "Data quality notes"
+expander, since nothing in the UI displayed status before.
+
+**BUG 6 (MEDIUM): a tz-aware `incident_time` silently produced an empty trace.**
+`t.timestamp >= not_before` raised TypeError (naive provider timestamps vs
+aware input); the blanket `except Exception` swallowed it and returned []. Two
+fixes: `_naive_utc()` normalises `incident_time` at the boundary, and the
+handler now re-raises TypeError/AttributeError/KeyError - our own defects must
+never be laundered into an empty result.
+Streamlit's `st.date_input` produces naive datetimes, so the shipped UI path
+was never affected; this was latent.
+
+Tests: 82 pass (5 new in TestFailuresAreNotFindings).

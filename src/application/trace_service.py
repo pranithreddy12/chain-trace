@@ -1,7 +1,7 @@
 import asyncio
 import time
 from typing import List, Dict, Set, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timezone
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -40,7 +40,20 @@ class TraceContext:
     address_repo: AddressRepository = field(default_factory=AddressRepository)
     tx_repo: TransactionRepository = field(default_factory=TransactionRepository)
     provider: Optional[BlockchainProvider] = None
+    # A forensics tool must never present "we could not query the chain" as
+    # "no funds moved". Count outcomes so the caller can tell them apart.
+    fetch_ok: int = 0
+    fetch_failed: int = 0
     settings = get_settings()
+
+
+def _naive_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    """Provider timestamps are naive UTC. A tz-aware value from the caller used
+    to raise deep inside the per-hop filter, where a blanket except turned it
+    into an empty trace. Normalise once, at the boundary."""
+    if dt is None or dt.tzinfo is None:
+        return dt
+    return dt.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 class TraceEngine:
@@ -110,11 +123,28 @@ class TraceEngine:
         )
         ctx.graph.add_node(seed_node)
         ctx.visited.add(seed_node.address.address)
-        ctx.queue.append((seed_address, 0, incident_time))
+        ctx.queue.append((seed_address, 0, _naive_utc(incident_time)))
 
         try:
             await self._bfs_trace(ctx, max_depth, max_branches, token_filter)
-            investigation.mark_completed(graph)
+            if ctx.fetch_failed and not ctx.fetch_ok:
+                # Every lookup failed: the empty graph is our failure, not a
+                # finding about this wallet. Never let that read as "no funds
+                # moved" - an investigator would act on the wrong conclusion.
+                investigation.mark_failed(
+                    f"All {ctx.fetch_failed} address lookup(s) failed; no "
+                    f"chain data was retrieved. This is NOT evidence that the "
+                    f"wallet is inactive."
+                )
+            elif ctx.fetch_failed:
+                investigation.mark_partial(
+                    f"{ctx.fetch_failed} of "
+                    f"{ctx.fetch_ok + ctx.fetch_failed} address lookup(s) "
+                    f"failed; the trail below is incomplete.",
+                    graph,
+                )
+            else:
+                investigation.mark_completed(graph)
         except Exception as e:
             investigation.mark_failed(str(e))
             raise
@@ -267,6 +297,7 @@ class TraceEngine:
             for t in transfers:
                 self.tx_repo.save_transfer(t)
 
+            ctx.fetch_ok += 1
             return transfers
         except ProviderError as e:
             if e.retryable:
@@ -283,10 +314,17 @@ class TraceEngine:
                 f"Fetch timed out for {address[:12]} after "
                 f"{ctx.settings.per_address_fetch_timeout_seconds}s — skipped"
             )
+            ctx.fetch_failed += 1
             return []
+        except (TypeError, AttributeError, KeyError):
+            # Ours, not the provider's. Swallowing these turned a real defect
+            # (e.g. comparing tz-aware and naive datetimes) into a silent empty
+            # trace that looked like a legitimate "no activity" result.
+            raise
         except Exception as e:
+            ctx.fetch_failed += 1
             ctx.investigation.warnings.append(
-                f"Unexpected error for {address}: {str(e)}"
+                f"Could not fetch transfers for {address}: {str(e)}"
             )
             return []
 

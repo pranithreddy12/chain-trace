@@ -142,3 +142,83 @@ class TestUnusableAmounts:
 
     def test_normal_amount_is_usable(self):
         assert _transfer("a", "b", 1.5).amount_is_usable is True
+
+
+class TestFailuresAreNotFindings:
+    """Second audit: a failed lookup must never read as 'no funds moved'."""
+
+    def _engine_with(self, fetch):
+        from unittest.mock import Mock, AsyncMock
+        from src.application.trace_service import TraceEngine
+
+        p = Mock()
+        p.chain = Chain.ETHEREUM
+        p.get_all_outgoing_transfers = fetch
+        p.close = AsyncMock()
+        return TraceEngine(), p
+
+    def _run(self, engine, provider, **kw):
+        import asyncio
+        from unittest.mock import patch
+
+        with patch.object(engine, "_get_provider", return_value=provider):
+            return asyncio.run(
+                engine.trace("0xseed", Chain.ETHEREUM, max_depth=2,
+                             max_branches=5, **kw)
+            )
+
+    def test_total_provider_failure_is_marked_failed(self):
+        from src.domain.enums import InvestigationStatus
+
+        async def boom(address, **kw):
+            raise RuntimeError("provider exploded")
+
+        e, p = self._engine_with(boom)
+        r = self._run(e, p)
+        assert r.investigation.status == InvestigationStatus.FAILED
+        assert "NOT evidence" in r.investigation.error
+
+    def test_partial_failure_is_marked_partial(self):
+        from src.domain.enums import InvestigationStatus
+
+        async def half(address, **kw):
+            if address.lower() == "0xa":
+                raise RuntimeError("rate limited")
+            return [_transfer("0xseed", "0xa", 100)]
+
+        e, p = self._engine_with(half)
+        r = self._run(e, p)
+        assert r.investigation.status == InvestigationStatus.PARTIAL
+
+    def test_clean_trace_still_completes(self):
+        from src.domain.enums import InvestigationStatus
+
+        async def ok(address, **kw):
+            return [_transfer("0xseed", "0xa", 100)] if address.lower() == "0xseed" else []
+
+        e, p = self._engine_with(ok)
+        r = self._run(e, p)
+        assert r.investigation.status == InvestigationStatus.COMPLETED
+
+    def test_timezone_aware_incident_time_is_normalised(self):
+        """Used to raise inside the per-hop filter and be swallowed as empty."""
+        from datetime import timezone
+
+        async def ok(address, **kw):
+            return [_transfer("0xseed", "0xa", 100, minutes=5)] if address.lower() == "0xseed" else []
+
+        e, p = self._engine_with(ok)
+        r = self._run(e, p, incident_time=NOW.replace(tzinfo=timezone.utc))
+        assert "0xa" in r.graph.nodes
+
+    def test_our_own_bugs_are_not_swallowed(self):
+        """A TypeError from our code must surface, not become an empty trace."""
+        async def broken(address, **kw):
+            return "not a list of transfers".no_such_attribute
+
+        e, p = self._engine_with(broken)
+        try:
+            self._run(e, p)
+        except AttributeError:
+            return
+        raise AssertionError("programming error was swallowed")
