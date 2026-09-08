@@ -6,29 +6,55 @@ from ..domain.models.investigation import CandidateEndpoint
 from ..domain.models.address import Address
 from ..domain.models.transfer import Transfer
 from ..domain.enums import EntityCategory, Chain
+from ..config.settings import get_settings
+from .taint import dominant_path
 
 
 class PathAnalyzer:
+    def __init__(self):
+        self.settings = get_settings()
+
     def find_candidate_endpoints(
         self, graph: TransactionGraph, seed_address: Address
     ) -> List[CandidateEndpoint]:
-        endpoints = []
+        """Where did the money end up?
+
+        A candidate is any wallet that is (a) a labelled exchange/sanctioned
+        entity, (b) already flagged as an endpoint, or (c) TERMINAL in the traced
+        window (the money arrived and we did not observe it leave) while holding
+        a material share of the seed's tainted value. (c) is what makes
+        unlabelled chains produce leads at all.
+        """
         seed_addr = (
             seed_address.address.lower()
             if seed_address.chain.is_evm
             else seed_address.address
         )
 
+        senders = {e.transfer.normalized_from() for e in graph.edges}
+        min_taint = self.settings.min_endpoint_taint_fraction
+
+        endpoints = []
         for addr, node in graph.nodes.items():
-            if node.is_endpoint or node.address.entity_type in (
+            if addr == seed_addr:
+                continue
+            labelled = node.address.entity_type in (
                 EntityCategory.EXCHANGE,
                 EntityCategory.SANCTIONED,
-            ):
-                endpoint = self._analyze_endpoint(graph, seed_addr, addr, node)
-                if endpoint:
-                    endpoints.append(endpoint)
+            )
+            terminal = addr not in senders
+            material = node.taint_fraction >= min_taint
+            if not (labelled or node.is_endpoint or (terminal and material)):
+                continue
+            endpoint = self._analyze_endpoint(graph, seed_addr, addr, node, terminal)
+            if endpoint:
+                endpoints.append(endpoint)
 
-        return endpoints
+        # rank by how much of the victim's money got here, then by hop distance
+        endpoints.sort(
+            key=lambda e: (e.taint_fraction, -e.hop_count), reverse=True
+        )
+        return endpoints[: self.settings.max_candidate_endpoints]
 
     def _analyze_endpoint(
         self,
@@ -36,12 +62,17 @@ class PathAnalyzer:
         seed_addr: str,
         endpoint_addr: str,
         endpoint_node: GraphNode,
+        is_terminal: bool = False,
     ) -> Optional[CandidateEndpoint]:
-        paths = self._find_paths_to(graph, seed_addr, endpoint_addr)
-        if not paths:
-            return None
-
-        shortest_path = min(paths, key=len)
+        # Prefer the path the MONEY took (highest taint carried at each hop)
+        # over the topologically shortest one; fall back to nx when there is no
+        # taint data (e.g. graphs built directly in unit tests).
+        shortest_path = dominant_path(graph, seed_addr, endpoint_addr)
+        if not shortest_path:
+            paths = self._find_paths_to(graph, seed_addr, endpoint_addr)
+            if not paths:
+                return None
+            shortest_path = min(paths, key=len)
         path_transfers = self._get_path_transfers(graph, shortest_path)
 
         # Amount actually arriving at the endpoint = the final transfer into it,
@@ -73,23 +104,33 @@ class PathAnalyzer:
                 ).total_seconds()
             )
 
-        amount_concentration = (
-            total_amount / original_amount if original_amount > 0 else 0
-        )
+        # Taint fraction IS the concentration when we have it: it already
+        # accounts for splits along the way. Fall back to the raw ratio.
+        if endpoint_node.taint_fraction > 0:
+            amount_concentration = endpoint_node.taint_fraction
+        else:
+            amount_concentration = (
+                total_amount / original_amount if original_amount > 0 else 0
+            )
 
         return CandidateEndpoint(
             address=endpoint_node.address,
-            total_amount_received=str(total_amount),
+            total_amount_received=str(
+                endpoint_node.tainted_value or total_amount
+            ),
             hop_count=hop_count,
             unlabeled_hop_count=unlabeled_hops,
             amount_concentration=min(1.0, amount_concentration),
             path_directness=1.0 / (1.0 + unlabeled_hops),
             label_confidence=endpoint_node.address.confidence,
+            tainted_value=endpoint_node.tainted_value,
+            taint_fraction=endpoint_node.taint_fraction,
+            is_terminal=is_terminal,
             path=path_transfers,
             obfuscation_points=obfuscation_points,
             elapsed_seconds=elapsed,
             evidence=self._generate_evidence(
-                endpoint_node, path_transfers, obfuscation_points
+                endpoint_node, path_transfers, obfuscation_points, is_terminal
             ),
         )
 
@@ -132,9 +173,22 @@ class PathAnalyzer:
         return seed_outgoing
 
     def _generate_evidence(
-        self, node: GraphNode, path_transfers: List[Transfer], obfuscation_points: int
+        self,
+        node: GraphNode,
+        path_transfers: List[Transfer],
+        obfuscation_points: int,
+        is_terminal: bool = False,
     ) -> List[str]:
         evidence = []
+
+        if node.taint_fraction > 0:
+            evidence.append(
+                f"{node.taint_fraction * 100:.1f}% of the reported funds reached here"
+            )
+        if is_terminal and node.address.entity_type == EntityCategory.UNKNOWN:
+            evidence.append(
+                "Funds arrived and were not observed leaving within the traced window"
+            )
 
         if node.address.entity_type == EntityCategory.EXCHANGE:
             evidence.append(

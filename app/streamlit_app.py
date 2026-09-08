@@ -16,6 +16,7 @@ from src.domain.enums import Chain, EntityCategory, NodeType, InvestigationStatu
 from src.domain.models.address import Address
 from src.application.investigation_service import InvestigationService
 from src.application.report_service import ReportService
+from src.demo.scenario import DEMO_WALKTHROUGH, run_demo_investigation
 try:
     from graph_view import render_star_graph
 except ModuleNotFoundError:
@@ -109,6 +110,24 @@ def render_input_form():
             help="Filter by specific token contract",
         )
 
+    ca1, ca2 = st.columns(2)
+    with ca1:
+        incident_date = st.date_input(
+            "Incident date (optional)",
+            value=None,
+            help="Only follow transfers from this date onward - funds cannot "
+            "move backwards from the incident. Cuts a lot of unrelated history.",
+        )
+    with ca2:
+        reported_amount = st.number_input(
+            "Reported amount stolen (optional)",
+            min_value=0.0,
+            value=0.0,
+            step=100.0,
+            help="Anchors the trace on this amount instead of the wallet's "
+            "entire outflow, so unrelated sends do not dilute the percentages.",
+        )
+
     with col5:
         max_branches = st.number_input(
             "Max Branches",
@@ -126,6 +145,13 @@ def render_input_form():
             use_container_width=True,
             disabled=st.session_state.trace_running,
         )
+        demo_button = st.button(
+            "🎬 Demo case",
+            use_container_width=True,
+            disabled=st.session_state.trace_running,
+            help="Runs a fabricated laundering case through the real analysis "
+            "pipeline - no API keys and no network needed.",
+        )
 
     return {
         "seed_address": seed_address,
@@ -133,7 +159,14 @@ def render_input_form():
         "max_depth": max_depth,
         "max_branches": max_branches,
         "token_filter": token_filter if token_filter else None,
+        "incident_time": (
+            datetime.combine(incident_date, datetime.min.time())
+            if incident_date
+            else None
+        ),
+        "reported_amount": reported_amount if reported_amount > 0 else None,
         "trace_button": trace_button,
+        "demo_button": demo_button,
     }
 
 
@@ -339,6 +372,9 @@ def render_endpoints_table(result):
                 "Amount": ep.total_amount_received,
                 "Hops": ep.hop_count,
                 "Unlabeled": ep.unlabeled_hop_count,
+                "Funds reaching here": f"{ep.taint_fraction * 100:.1f}%",
+                "Flow conf.": f"{ep.flow_confidence * 100:.0f}%",
+                "Entity conf.": f"{ep.entity_confidence * 100:.0f}%",
                 "Confidence": f"{ep.confidence_score * 100:.1f}%",
                 "Evidence": "; ".join(ep.evidence[:2]) if ep.evidence else "—",
                 "Patterns": ", ".join(ep.pattern_flags) if ep.pattern_flags else "—",
@@ -500,7 +536,25 @@ def main():
 
     input_data = render_input_form()
 
+    if input_data["demo_button"]:
+        st.session_state.investigation_result = None
+        st.session_state.selected_node = None
+        st.session_state.highlighted_path = None
+        with st.spinner("Running the demo case through the analysis pipeline..."):
+            try:
+                st.session_state.investigation_result = run_async(
+                    run_demo_investigation(
+                        get_investigation_service(),
+                        max_depth=input_data["max_depth"],
+                    )
+                )
+                st.session_state.is_demo = True
+                st.rerun()
+            except Exception as e:
+                st.error(f"Demo failed: {e}")
+
     if input_data["trace_button"] and input_data["seed_address"]:
+        st.session_state.is_demo = False
         st.session_state.trace_running = True
         st.session_state.investigation_result = None
         st.session_state.selected_node = None
@@ -516,6 +570,8 @@ def main():
                         max_depth=input_data["max_depth"],
                         max_branches=input_data["max_branches"],
                         token_filter=input_data["token_filter"],
+                        incident_time=input_data["incident_time"],
+                        reported_amount=input_data["reported_amount"],
                     )
                 )
                 st.session_state.investigation_result = result
@@ -531,6 +587,20 @@ def main():
 
     if st.session_state.investigation_result:
         result = st.session_state.investigation_result
+        if st.session_state.get("is_demo"):
+            st.info(
+                "**Demo case - fabricated data.** A 250,000 USDT theft laundered "
+                "through 8 mule wallets, a mixer and an unlabelled deposit "
+                "cluster, ending at a real exchange. Every address is invented "
+                "except the Tornado Cash, OFAC-sanctioned and Binance addresses, "
+                "which are genuine public ones so entity matching runs for real. "
+                "The trace, taint propagation, pattern detection, behavioural "
+                "classification and scoring are the production code paths - "
+                "nothing below is canned output."
+            )
+            with st.expander("How the trail is followed, hop by hop", expanded=True):
+                for i, (title, detail) in enumerate(DEMO_WALKTHROUGH, 1):
+                    st.markdown(f"**{i}. {title}** - {detail}")
         render_investigation_summary(result)
         render_case_summary(result)
         render_main_graph(result)

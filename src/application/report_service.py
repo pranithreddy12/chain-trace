@@ -65,6 +65,10 @@ class ReportService:
                     "hop_count": ep.hop_count,
                     "unlabeled_hops": ep.unlabeled_hop_count,
                     "confidence": f"{ep.confidence_score * 100:.1f}%",
+                    "flow_confidence": f"{ep.flow_confidence * 100:.0f}%",
+                    "entity_confidence": f"{ep.entity_confidence * 100:.0f}%",
+                    "taint_fraction": f"{ep.taint_fraction * 100:.1f}%",
+                    "is_terminal": ep.is_terminal,
                     "evidence": ep.evidence,
                     "pattern_flags": ep.pattern_flags,
                     "obfuscation_points": ep.obfuscation_points,
@@ -135,7 +139,10 @@ class ReportService:
                     f"    Type: {ep['entity_type']}",
                     f"    Amount: {ep['amount_received']}",
                     f"    Hops: {ep['hop_count']} ({ep['unlabeled_hops']} unlabeled)",
-                    f"    Confidence: {ep['confidence']}",
+                    f"    Confidence: {ep['confidence']}  "
+                    f"(flow {ep['flow_confidence']} / entity {ep['entity_confidence']})",
+                    f"    Share of reported funds reaching here: {ep['taint_fraction']}"
+                    + ("  [TRAIL ENDS HERE]" if ep.get("is_terminal") else ""),
                     f"    Evidence: {', '.join(ep['evidence']) if ep['evidence'] else 'None'}",
                     f"    Patterns: {', '.join(ep['pattern_flags']) if ep['pattern_flags'] else 'None'}",
                     "",

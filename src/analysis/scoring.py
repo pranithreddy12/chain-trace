@@ -45,12 +45,22 @@ class ScoringEngine:
             else self._calculate_label_confidence(endpoint)
         )
 
-        raw_score = (
-            0.30 * path_directness
-            + 0.35 * amount_concentration
-            + 0.35 * label_confidence
+        # TWO ORTHOGONAL AXES.
+        #  flow   = how sure are we the money went here (pure on-chain, always
+        #           computable, no labels needed)
+        #  entity = how sure are we WHAT this address is (labels only)
+        # A wallet can be flow 0.9 / entity 0.0 -> "money is here, owner unknown"
+        # which is the most actionable lead an investigator can get.
+        # Taint fraction already accounts for every split along the way, so a
+        # long chain must NOT be penalised twice. Directness only modulates:
+        # a direct path is fully trusted, a long unlabelled one keeps 60%.
+        flow_confidence = min(
+            1.0, max(0.0, amount_concentration * (0.6 + 0.4 * path_directness))
         )
+        entity_confidence = min(1.0, max(0.0, label_confidence))
 
+        fw = self.settings.flow_weight
+        raw_score = fw * flow_confidence + (1.0 - fw) * entity_confidence
         final_score = min(1.0, max(0.0, raw_score))
 
         if endpoint.obfuscation_points > 0:
@@ -59,15 +69,23 @@ class ScoringEngine:
         reasons = self._generate_reasons(
             endpoint, path_directness, amount_concentration, label_confidence
         )
+        reasons.append(
+            f"Flow confidence {flow_confidence * 100:.0f}% / entity confidence "
+            f"{entity_confidence * 100:.0f}%"
+        )
 
         pattern_flags = self._get_pattern_flags(endpoint, graph)
 
         return {
             "score": final_score,
+            "flow_confidence": flow_confidence,
+            "entity_confidence": entity_confidence,
             "components": {
                 "path_directness": path_directness,
                 "amount_concentration": amount_concentration,
                 "label_confidence": label_confidence,
+                "flow_confidence": flow_confidence,
+                "entity_confidence": entity_confidence,
             },
             "reasons": reasons,
             "pattern_flags": pattern_flags,
@@ -114,9 +132,15 @@ class ScoringEngine:
         else:
             reasons.append(f"{endpoint.unlabeled_hop_count} unlabeled hops")
 
-        reasons.append(
-            f"{amount_concentration * 100:.0f}% of traced amount reached endpoint"
-        )
+        if endpoint.taint_fraction > 0:
+            reasons.append(
+                f"{amount_concentration * 100:.1f}% of the reported funds reached "
+                f"this wallet ({endpoint.tainted_value:,.2f} traced)"
+            )
+        else:
+            reasons.append(
+                f"{amount_concentration * 100:.0f}% of traced amount reached endpoint"
+            )
 
         if endpoint.address.entity_type == EntityCategory.EXCHANGE:
             if (
@@ -130,6 +154,11 @@ class ScoringEngine:
             reasons.append("Endpoint matches sanctions list")
         elif endpoint.address.label:
             reasons.append(f"Label: {endpoint.address.label}")
+        elif endpoint.is_terminal:
+            reasons.append(
+                "Unidentified wallet where the trail ends - priority target for "
+                "off-chain (exchange KYC / subpoena) follow-up"
+            )
 
         if endpoint.obfuscation_points > 0:
             reasons.append(

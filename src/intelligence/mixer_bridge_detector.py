@@ -15,21 +15,27 @@ class MixerBridgeDetector:
         self._load_known_contracts()
 
     def _load_known_contracts(self) -> None:
-        eth_mixers = {
-            "0x722122df12d4e14e13ac3b6895a86e84145b6967",  # Tornado Cash
-            "0x910cbd523d972eb0a6f4cae4618ad62622b39dbf",  # Tornado Cash
-            "0xa6e8772af29b29b98d071709743748d87d84d1b2",  # Tornado Cash
-        }
-        self.mixer_contracts[Chain.ETHEREUM] = {a.lower() for a in eth_mixers}
+        """Mixer/bridge contracts come from the entity datasets, not code.
 
-        tron_mixers = set()
-        self.mixer_contracts[Chain.TRON] = tron_mixers
+        Anything in data/labels|sanctions|entities with category `mixer` or
+        `bridge` is picked up here, so coverage is multichain and extendable
+        without a code change (see data/entities/README.md).
+        """
+        from .label_matcher import LabelMatcher
 
-        eth_bridges = {
-            "0x3ee18b2214aff97000d974cf647e7c347e8fa585",  # Wormhole
-            "0x83e45b4e8d4b7b9d0c5a7b7f7e8d9c0a1b2c3d4e",  # Multichain
-        }
-        self.bridge_contracts[Chain.ETHEREUM] = {a.lower() for a in eth_bridges}
+        for entry in LabelMatcher().all_entries():
+            try:
+                chain = Chain(entry.get("chain", "ethereum"))
+            except ValueError:
+                continue
+            addr = entry.get("address", "")
+            addr = addr.lower() if chain.is_evm else addr
+            if not addr:
+                continue
+            if entry.get("category") == "mixer":
+                self.mixer_contracts[chain].add(addr)
+            elif entry.get("category") == "bridge":
+                self.bridge_contracts[chain].add(addr)
 
     def detect(self, graph: TransactionGraph) -> List[str]:
         mixer_addresses = []
@@ -56,7 +62,14 @@ class MixerBridgeDetector:
                     mixer_addresses.append(from_addr)
 
         for addr, node in graph.nodes.items():
-            if node.address.entity_type == EntityCategory.MIXER:
+            chain = node.address.chain
+            key = addr.lower() if chain.is_evm else addr
+            if (
+                key in self.mixer_contracts.get(chain, set())
+                or key in self.bridge_contracts.get(chain, set())
+                or node.address.entity_type
+                in (EntityCategory.MIXER, EntityCategory.BRIDGE)
+            ):
                 mixer_addresses.append(addr)
 
         return list(set(mixer_addresses))

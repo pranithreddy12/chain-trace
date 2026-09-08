@@ -35,7 +35,9 @@ _LEGEND = [
     ("Exchange", "#ff5c7a"),
     ("Sanctioned", "#ff2d2d"),
     ("Mixer / bridge", "#ffb020"),
-    ("Suspicious", "#ff4d4d"),
+    ("Suspect · low conf", "#ffd23f"),
+    ("Suspect · medium", "#ff9f1a"),
+    ("Suspect · high", "#ff2d2d"),
     ("Intermediate", "#4da3ff"),
     ("Contract", "#8a7dff"),
     ("Unknown", "#8494a8"),
@@ -43,6 +45,31 @@ _LEGEND = [
 
 
 MAX_RENDER_NODES = 110
+
+# A suspect wallet is coloured by how confident the pipeline is that it matters,
+# not by a flat "suspicious" red. Hard entity types (exchange / sanctioned /
+# mixer / bridge / contract) keep their own colour: those are facts, not scores.
+_CONF_RAMP = [
+    (0.40, "#ffd23f"),   # weak lead - worth a look
+    (0.60, "#ffa62b"),
+    (0.80, "#ff5c33"),
+    (1.01, "#ff2d2d"),   # strong lead
+]
+_FACT_TYPES = {
+    NodeType.SEED.value,
+    NodeType.EXCHANGE.value,
+    NodeType.SANCTIONED_ADDRESS.value,
+    NodeType.MIXER.value,
+    NodeType.BRIDGE.value,
+    NodeType.CONTRACT_SERVICE.value,
+}
+
+
+def _conf_color(score):
+    for ceiling, color in _CONF_RAMP:
+        if score < ceiling:
+            return color
+    return _CONF_RAMP[-1][1]
 
 
 def _keep_nodes(result, highlighted_path):
@@ -109,6 +136,45 @@ def _build_payload(result, highlighted_path):
     def _sh(a):
         return f"{a[:6]}..{a[-4:]}"
 
+    # per-wallet confidence from the ranked leads (0..1)
+    lead_score = {
+        l["address"]: l.get("score", 0.0)
+        for l in (result.case_summary or {}).get("recommended_leads", [])
+    }
+
+    def _node_score(n, ranked):
+        """How confident are we that this wallet matters to the case?
+
+        A wallet that made the ranked-leads list uses that score directly.
+        Otherwise it is derived from the evidence already on the node: how much
+        of the traced money reached it, how strong its behavioural verdict is,
+        and how many patterns fired on it. Shown as a number in the tooltip so
+        the colour is never the only thing asserting it.
+        """
+        if ranked is not None:
+            return round(float(ranked), 2)
+        if not (n.is_suspicious or n.is_obfuscation_point):
+            return None
+        derived = (
+            0.20
+            + 0.45 * min(1.0, n.taint_fraction)
+            + 0.25 * n.behavior_confidence
+            + 0.05 * min(2, len(n.pattern_flags))
+        )
+        return round(min(0.80, derived), 2)
+
+    def _node_color(n, score):
+        t = n.node_type.value
+        # the seed is retyped suspicious_wallet once fan-out fires on it, but
+        # it is still the reported wallet and keeps the seed colour
+        if n.is_seed:
+            return _TYPE_COLOR[NodeType.SEED.value]
+        if t in _FACT_TYPES:
+            return _TYPE_COLOR.get(t, "#8494a8")
+        if score is None:
+            return _TYPE_COLOR.get(t, "#8494a8")
+        return _conf_color(score)
+
     nodes = []
     for nid, n in graph.nodes.items():
         if nid not in keep:
@@ -131,7 +197,9 @@ def _build_payload(result, highlighted_path):
                 "short": f"{nid[:6]}...{nid[-4:]}",
                 "label": n.address.label or "",
                 "type": n.node_type.value,
-                "color": _TYPE_COLOR.get(n.node_type.value, "#8494a8"),
+                "color": _node_color(n, _node_score(n, lead_score.get(nid))),
+            "score": _node_score(n, lead_score.get(nid)),
+            "ranked": nid in lead_score,
                 "depth": n.depth,
                 "inAmt": n.incoming_amount,
                 "outAmt": n.outgoing_amount,
@@ -314,6 +382,13 @@ window.addEventListener('error', function(e){
   }
   requestAnimationFrame(drawSky);
 
+  // colour == confidence, so always spell the number out next to it
+  function scoreLine(n){
+    if (n.score === null || n.score === undefined) return '';
+    return '<br>' + (n.ranked ? 'lead confidence' : 'signal strength')
+      + ': <b>' + (n.score * 100).toFixed(0) + '%</b>';
+  }
+
   function hexA(hex,a){
     hex=hex.replace('#','');
     if(hex.length===3) hex=hex[0]+hex[0]+hex[1]+hex[1]+hex[2]+hex[2];
@@ -355,6 +430,7 @@ window.addEventListener('error', function(e){
         + '<br>hop ' + n.depth + ' &middot; ' + n.type
         + '<br>in ' + n.inAmt + ' &middot; out ' + n.outAmt
         + '<br>from ' + n.fromN + ' wallet(s) &rarr; to ' + n.toN + ' wallet(s)'
+        + scoreLine(n)
         + '<br>patterns: ' + pats + '</div>';
     })
     .linkColor(function(l){ return l.onPath ? 'rgba(0,255,156,.6)' : 'rgba(130,170,235,.22)'; })
@@ -368,6 +444,10 @@ window.addEventListener('error', function(e){
       var hero = node.isSeed || node.isEndpoint || node.isSuspicious
               || node.isObf || node.onPath || node.type==='sanctioned_address'
               || node.type==='exchange';
+      // A node with no valid position yet (or NaN after a layout switch) would
+      // make createRadialGradient/arc throw, killing the render loop for EVERY
+      // node and leaving a blank canvas. Skip it instead.
+      if (!isFinite(node.x) || !isFinite(node.y)) return;
       var col = node.color;
       var r, glowR, glowA, coreA;
       if (hero){
@@ -381,6 +461,10 @@ window.addEventListener('error', function(e){
         r = 2.4 + Math.min(3.0, Math.sqrt(node.val) * 0.5);
         glowR = r*2.3; glowA = 0.5; coreA = 0.85;
       }
+      // Radii are graph units, so a zoomed-out view renders sub-pixel stars
+      // that read as an empty canvas. Hold a minimum on-screen size.
+      var minR = (hero ? 3.4 : 2.2) / scale;
+      if (r < minR){ glowR *= minR / r; r = minR; }
 
       var glow = ctx.createRadialGradient(node.x,node.y,0, node.x,node.y, glowR);
       glow.addColorStop(0, hexA(col, glowA));
@@ -404,6 +488,7 @@ window.addEventListener('error', function(e){
       }
     })
     .nodePointerAreaPaint(function(node, color, ctx){
+      if (!isFinite(node.x) || !isFinite(node.y)) return;
       ctx.fillStyle = color;
       ctx.beginPath(); ctx.arc(node.x,node.y, 6 + Math.sqrt(node.val)*2, 0, 6.2832); ctx.fill();
     })
@@ -420,12 +505,23 @@ window.addEventListener('error', function(e){
   Graph.graphData(DATA);
 
   var BIG = DATA.nodes.length > 60;
-  try {
-    Graph.d3Force('charge').strength(BIG ? -55 : -140);
-    Graph.d3Force('link').distance(function(l){ return l.onPath ? 50 : 26; });
-    Graph.d3VelocityDecay(0.45);
-    Graph.d3ReheatSimulation();
-  } catch (e) {}
+  // Flow mode packs nodes into dag columns, so it wants weak repulsion and
+  // short links. Free mode has no columns holding the shape apart - it needs
+  // much stronger repulsion and longer links or it collapses into a blob.
+  function applyForces(dag){
+    try {
+      Graph.d3Force('charge').strength(
+        dag ? (BIG ? -55 : -140) : (BIG ? -260 : -420)
+      );
+      Graph.d3Force('link').distance(function(l){
+        var base = dag ? 26 : (BIG ? 70 : 95);
+        return l.onPath ? base * 1.9 : base;
+      });
+      Graph.d3VelocityDecay(dag ? 0.45 : 0.30);
+      Graph.d3ReheatSimulation();
+    } catch (e) {}
+  }
+  applyForces(true);
 
   function coreCenter(){
     var pts = DATA.nodes.filter(function(n){
@@ -443,25 +539,41 @@ window.addEventListener('error', function(e){
         || n.type === 'exchange' || n.type === 'sanctioned_address';
   }
   var CORE_N = DATA.nodes.filter(isCore).length;
-  function fitView(){
+  // ms MUST stay below the settling-interval below: zoomToFit's tween is
+  // cancelled by the next call, so a long one never reaches its target and
+  // the graph stays zoomed out in a corner.
+  function fitView(ms){
+    ms = ms || 0;
     try {
-      var c = coreCenter();
-      if (c) Graph.centerAt(c.x, c.y, 300);
+      // No centerAt here: zoomToFit pans and zooms itself, and a second
+      // concurrent tween just fights it, leaving the graph off-centre.
       // fit to the core only when there's enough of it to frame the picture;
       // otherwise fit the whole constellation
-      if (CORE_N >= 5) Graph.zoomToFit(400, 55, isCore);
-      else Graph.zoomToFit(400, 45);
+      // Framing only the core is fine on a small graph, but on a big one it
+      // leaves most of the constellation outside the viewport.
+      // padding has to clear the node LABELS too, not just the dots - a wide
+      // address caption on the last hop otherwise hangs off the edge.
+      if (CORE_N >= 5 && DATA.nodes.length <= 60) Graph.zoomToFit(ms, 95, isCore);
+      else Graph.zoomToFit(ms, 60);
       var z = Graph.zoom();
-      if (z < 0.5) Graph.zoom(0.5, 250);
-      else if (z > 2.6) Graph.zoom(2.6, 250);
+      // No meaningful zoom floor: clamping the fit is what pushed big graphs
+      // off-screen. Stars stay readable via the min-screen-radius in the
+      // node painter instead.
+      if (z < 0.05) Graph.zoom(0.05, ms);
+      else if (z > 2.6) Graph.zoom(2.6, ms);
     } catch (e) {}
   }
   // Re-fit repeatedly while the layout is still settling, then stop.
-  var fits = 0;
-  var fitTimer = setInterval(function(){
-    fitView();
-    if (++fits > 18) clearInterval(fitTimer);
-  }, 280);
+  var fitTimer = null;
+  function settleAndFit(n){
+    if (fitTimer) clearInterval(fitTimer);
+    var fits = 0;
+    fitTimer = setInterval(function(){
+      fitView();
+      if (++fits > n) { clearInterval(fitTimer); fitTimer = null; }
+    }, 280);
+  }
+  settleAndFit(18);
 
   document.getElementById('fit').onclick = function(){ fitView(55); hidePanel(); };
 
@@ -472,9 +584,22 @@ window.addEventListener('error', function(e){
     dagOn = !dagOn;
     this.classList.toggle('on', dagOn);
     this.textContent = dagOn ? 'flow view' : 'free layout';
-    Graph.dagMode(dagOn ? 'lr' : null);
-    try { Graph.d3ReheatSimulation(); } catch(e){}
-    setTimeout(function(){ fitView(); }, 400);
+    try {
+      Graph.dagMode(dagOn ? 'lr' : null);
+      // dagMode pins each node on the dag axis via fx/fy and does NOT release
+      // them when you turn it off — nodes stay frozen, and any node the dag
+      // never levelled (cycle nodes skipped by onDagError) carries an undefined
+      // fx that becomes NaN once the simulation runs. Clear and re-seed.
+      DATA.nodes.forEach(function(n){
+        if (!dagOn) { n.fx = undefined; n.fy = undefined; }
+        if (!isFinite(n.x)) n.x = (Math.random() - 0.5) * 200;
+        if (!isFinite(n.y)) n.y = (Math.random() - 0.5) * 200;
+      });
+    } catch (e) {}
+    applyForces(dagOn);
+    // Free mode re-lays the whole graph from the dag positions, which takes a
+    // while - keep re-fitting until it settles instead of framing the old shape.
+    settleAndFit(dagOn ? 12 : 26);
   };
 
   // --- fullscreen ---
@@ -518,6 +643,7 @@ window.addEventListener('error', function(e){
       '<div>type: <b>' + n.type + '</b> &middot; hop <b>' + n.depth + '</b></div>'
       + '<div>in <b>' + n.inAmt + '</b> &middot; out <b>' + n.outAmt + '</b></div>'
       + fromLine + toLine
+      + (scoreLine(n) ? '<div>' + scoreLine(n).slice(4) + '</div>' : '')
       + '<div>patterns: <b>' + pats + '</b></div>';
     document.getElementById('panel').classList.remove('hidden');
   }

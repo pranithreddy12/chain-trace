@@ -75,6 +75,8 @@ class TraceEngine:
         max_depth: int = 4,
         max_branches: int = 25,
         token_filter: Optional[str] = None,
+        incident_time: Optional[datetime] = None,
+        reported_amount: Optional[float] = None,
     ) -> InvestigationResult:
         seed_address = (
             seed_address.lower() if chain.is_evm else seed_address
@@ -86,6 +88,8 @@ class TraceEngine:
             max_depth=max_depth,
             max_branches=max_branches,
             token_filter=token_filter,
+            incident_time=incident_time,
+            reported_amount=reported_amount,
         )
         investigation.mark_running()
 
@@ -106,7 +110,7 @@ class TraceEngine:
         )
         ctx.graph.add_node(seed_node)
         ctx.visited.add(seed_node.address.address)
-        ctx.queue.append((seed_address, 0))
+        ctx.queue.append((seed_address, 0, incident_time))
 
         try:
             await self._bfs_trace(ctx, max_depth, max_branches, token_filter)
@@ -145,13 +149,13 @@ class TraceEngine:
                 )
                 break
 
-            current_address, depth = ctx.queue.popleft()
+            current_address, depth, not_before = ctx.queue.popleft()
 
             if depth >= max_depth:
                 continue
 
             transfers = await self._get_outgoing_transfers(
-                ctx, current_address, token_filter
+                ctx, current_address, token_filter, not_before
             )
 
             ctx.investigation.transactions_examined += len(transfers)
@@ -159,6 +163,10 @@ class TraceEngine:
             # Branch limit caps how many *distinct new wallets* we expand from
             # this node — but every real transfer still becomes an edge, including
             # repeated transfers to an address we've already added.
+            # Largest-value transfers first, so when the branch limit bites it
+            # keeps the money path instead of whatever the API returned first.
+            transfers = sorted(transfers, key=lambda t: t.amount_float, reverse=True)
+
             new_nodes = 0
             limit_hit = False
             for transfer in transfers:
@@ -180,11 +188,18 @@ class TraceEngine:
                 await self._process_transfer(
                     ctx, transfer, depth, to_address, enqueue=enqueue
                 )
+                if enqueue:
+                    # money can only leave a wallet AFTER it arrived there
+                    ctx.queue[-1] = (to_address, depth + 1, transfer.timestamp)
                 if is_new_node:
                     new_nodes += 1
 
     async def _get_outgoing_transfers(
-        self, ctx: TraceContext, address: str, token_filter: Optional[str]
+        self,
+        ctx: TraceContext,
+        address: str,
+        token_filter: Optional[str],
+        not_before: Optional[datetime] = None,
     ) -> List[Transfer]:
         normalized = (
             address.lower() if ctx.investigation.chain.is_evm else address
@@ -226,6 +241,16 @@ class TraceEngine:
                     f"Ignored {dropped} implausible-amount transfer(s) for "
                     f"{address[:12]} (likely scam/airdrop tokens)"
                 )
+
+            if not_before is not None:
+                before = len(transfers)
+                transfers = [t for t in transfers if t.timestamp >= not_before]
+                skipped = before - len(transfers)
+                if skipped:
+                    ctx.investigation.warnings.append(
+                        f"Skipped {skipped} transfer(s) from {address[:12]} that "
+                        f"predate the traced funds arriving there"
+                    )
 
             for t in transfers:
                 self.tx_repo.save_transfer(t)
@@ -283,7 +308,8 @@ class TraceEngine:
 
         if enqueue:
             ctx.visited.add(to_address)
-            ctx.queue.append((to_address, depth + 1))
+            # placeholder timestamp; _bfs_trace rewrites it with the arrival time
+            ctx.queue.append((to_address, depth + 1, None))
 
     async def _get_or_create_address(
         self, ctx: TraceContext, address: str, depth: int

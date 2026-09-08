@@ -274,9 +274,8 @@ export default function ConstellationGraph({ nodes, links }: Props) {
     });
 
     // avoid duplicate listeners / stale closures across StrictMode remounts    if (!wrap) return;
-    const _rh = resizeHandler;
-    window.removeEventListener('resize', _rh);
-    window.addEventListener('resize', _rh);
+    window.removeEventListener('resize', resizeHandler);
+    window.addEventListener('resize', resizeHandler);
 
     function resizeHandler() {
       const w = wrap.clientWidth || W;

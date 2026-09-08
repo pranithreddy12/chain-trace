@@ -9,15 +9,20 @@ from ..domain.models.investigation import (
 from ..domain.models.graph import TransactionGraph, GraphNode
 from ..domain.models.address import Address
 from ..domain.models.transfer import Transfer
-from ..domain.enums import Chain, EntityCategory, NodeType
+from ..domain.enums import Chain, EntityCategory, NodeType, LabelSource
 from ..application.trace_service import TraceEngine, trace_funds
 from ..intelligence.label_matcher import LabelMatcher
 from ..intelligence.exchange_inference import ExchangeInference
 from ..intelligence.mixer_bridge_detector import MixerBridgeDetector
+from ..intelligence.behavior_classifier import (
+    classify_wallets,
+    EXCHANGE_DEPOSIT,
+)
 from ..analysis.pattern_detector import PatternDetector
 from ..analysis.path_analyzer import PathAnalyzer
 from ..analysis.scoring import ScoringEngine
 from ..analysis.case_summary import build_case_summary
+from ..analysis.taint import propagate_taint
 from ..persistence.repositories import InvestigationRepository
 
 
@@ -39,13 +44,34 @@ class InvestigationService:
         max_depth: int = 4,
         max_branches: int = 25,
         token_filter: Optional[str] = None,
+        incident_time: Optional[datetime] = None,
+        reported_amount: Optional[float] = None,
     ) -> InvestigationResult:
         result = await self.trace_engine.trace(
-            seed_address, chain, max_depth, max_branches, token_filter
+            seed_address,
+            chain,
+            max_depth,
+            max_branches,
+            token_filter,
+            incident_time=incident_time,
+            reported_amount=reported_amount,
         )
 
         await self._enrich_with_intelligence(result)
         self._detect_patterns(result)
+        # Follow the victim's money before ranking anything: taint gives every
+        # wallet a defensible "how much of the reported funds reached here".
+        seed_key = (
+            result.seed_address.address.lower()
+            if result.seed_address.chain.is_evm
+            else result.seed_address.address
+        )
+        # Anchor taint on the reported stolen amount when the victim gave one,
+        # so unrelated activity by the same wallet does not dilute the fractions.
+        propagate_taint(result.graph, seed_key, origin_amount=reported_amount)
+        # Behaviour classification needs taint, so it runs after propagation and
+        # before path analysis (it can promote wallets to candidate endpoints).
+        self._classify_behaviour(result)
         self._analyze_paths(result)
         self._score_endpoints(result)
         result.case_summary = build_case_summary(result)
@@ -97,6 +123,46 @@ class InvestigationService:
                 node.node_type = NodeType.MIXER
                 node.is_obfuscation_point = True
 
+    def _classify_behaviour(self, result: InvestigationResult) -> None:
+        """Label-independent typing of every wallet (Tier-3/4, UNVERIFIED).
+
+        Only `exchange_deposit` promotes an address to an entity claim, and only
+        as a sweep-inference label at capped confidence - everything else is
+        recorded as behavioural context, never as ownership.
+        """
+        profiles = classify_wallets(result.graph, result.pattern_detections)
+        result.wallet_profiles = {
+            a: {
+                "behavior": p.behavior,
+                "confidence": p.confidence,
+                "signals": p.signals,
+                "metrics": p.metrics,
+            }
+            for a, p in profiles.items()
+        }
+
+        for addr, p in profiles.items():
+            node = result.graph.nodes.get(addr)
+            if node is None:
+                continue
+            node.behavior = p.behavior
+            node.behavior_confidence = p.confidence
+            node.behavior_signals = list(p.signals)
+
+            # A behavioural verdict is Tier-3 evidence. It must NOT become an
+            # entity_type/node_type of EXCHANGE: that is a hard attribution
+            # claim, and asserting it from shape alone is exactly the false
+            # positive the guardrails exist to prevent (a mule sweeping into a
+            # layering wallet looks identical to a deposit wallet sweeping into
+            # an exchange hot wallet). Surface it as a lead instead, and let the
+            # behaviour fields carry the UNVERIFIED wording.
+            if (
+                p.behavior == EXCHANGE_DEPOSIT
+                and node.address.entity_type == EntityCategory.UNKNOWN
+            ):
+                node.address.source = LabelSource.SWEEP_INFERENCE
+                node.is_endpoint = True
+
     def _detect_patterns(self, result: InvestigationResult) -> None:
         patterns = self.pattern_detector.detect_all(result.graph)
         result.pattern_detections = patterns
@@ -121,12 +187,20 @@ class InvestigationService:
         )
         result.candidate_endpoints = endpoints
 
+        # Marking a node an endpoint must not erase what it IS. This used to
+        # reset everything except exchanges to UNKNOWN, which silently threw
+        # away sanctioned and mixer classifications - the highest-severity
+        # signals the tool produces - and rendered them as anonymous wallets.
+        _BY_ENTITY = {
+            EntityCategory.EXCHANGE: NodeType.EXCHANGE,
+            EntityCategory.SANCTIONED: NodeType.SANCTIONED_ADDRESS,
+            EntityCategory.MIXER: NodeType.MIXER,
+            EntityCategory.BRIDGE: NodeType.BRIDGE,
+        }
         for node in result.graph.nodes.values():
             if node.is_endpoint:
-                node.node_type = (
-                    NodeType.EXCHANGE
-                    if node.address.entity_type == EntityCategory.EXCHANGE
-                    else NodeType.UNKNOWN
+                node.node_type = _BY_ENTITY.get(
+                    node.address.entity_type, NodeType.UNKNOWN
                 )
 
     def _score_endpoints(self, result: InvestigationResult) -> None:
@@ -140,6 +214,12 @@ class InvestigationService:
                 "amount_concentration"
             ]
             endpoint.label_confidence = score_result["components"]["label_confidence"]
+            endpoint.flow_confidence = score_result["flow_confidence"]
+            endpoint.entity_confidence = score_result["entity_confidence"]
+            _n = result.graph.nodes.get(endpoint.address.address)
+            if _n is not None:
+                endpoint.behavior = _n.behavior
+                endpoint.behavior_confidence = _n.behavior_confidence
             endpoint.evidence = score_result["reasons"]
             endpoint.pattern_flags = score_result.get("pattern_flags", [])
 

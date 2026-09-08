@@ -18,6 +18,18 @@ class Investigation(BaseModel):
     token_filter: Optional[str] = Field(
         default=None, description="Optional token contract to filter"
     )
+    # Case anchoring: a real report is "X stolen on DATE", not "trace this
+    # wallet forever". Both optional; both dramatically cut noise.
+    incident_time: Optional[datetime] = Field(
+        default=None,
+        description="Only follow transfers at/after this time (funds cannot "
+        "move backwards from the incident)",
+    )
+    reported_amount: Optional[float] = Field(
+        default=None,
+        description="Amount reported stolen; anchors taint instead of using the "
+        "seed's entire outflow",
+    )
     start_time: datetime = Field(default_factory=datetime.utcnow)
     completed_at: Optional[datetime] = None
     status: InvestigationStatus = InvestigationStatus.PENDING
@@ -57,6 +69,14 @@ class CandidateEndpoint(BaseModel):
     amount_concentration: float = Field(default=0.0, ge=0.0, le=1.0)
     path_directness: float = Field(default=0.0, ge=0.0, le=1.0)
     label_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    # two orthogonal axes: how sure the money went here vs what this address is
+    flow_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    entity_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    tainted_value: float = 0.0
+    taint_fraction: float = Field(default=0.0, ge=0.0, le=1.0)
+    is_terminal: bool = False
+    behavior: Optional[str] = None
+    behavior_confidence: float = 0.0
     confidence_score: float = Field(default=0.0, ge=0.0, le=1.0)
     path: List[Transfer] = Field(default_factory=list)
     pattern_flags: List[str] = Field(default_factory=list)
@@ -77,6 +97,7 @@ class InvestigationResult(BaseModel):
     suspicious_addresses: List[Address] = Field(default_factory=list)
     pattern_detections: Dict[str, List[Dict[str, Any]]] = Field(default_factory=dict)
     case_summary: Dict[str, Any] = Field(default_factory=dict)
+    wallet_profiles: Dict[str, Any] = Field(default_factory=dict)
     warnings: List[str] = Field(default_factory=list)
 
     @property

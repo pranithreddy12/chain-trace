@@ -11,10 +11,8 @@ from typing import Any, Dict, List
 
 from ..domain.models.investigation import InvestigationResult
 from ..domain.enums import EntityCategory
-
-# A wallet that receives from at least this many distinct in-graph addresses is
-# treated as a convergence / consolidation point.
-CONVERGENCE_MIN_SENDERS = 4
+from ..config.settings import get_settings
+from .taint import dominant_path
 # A dispersal burst this many recipients or more, inside the burst window.
 BURST_MIN_RECIPIENTS = 6
 BURST_WINDOW_SECONDS = 3600
@@ -25,6 +23,7 @@ def _fmt_amt(x: float) -> str:
 
 
 def build_case_summary(result: InvestigationResult) -> Dict[str, Any]:
+    cfg = get_settings()
     g = result.graph
     seed = result.seed_address.address
     seed_norm = seed.lower() if result.seed_address.chain.is_evm else seed
@@ -53,6 +52,31 @@ def build_case_summary(result: InvestigationResult) -> Dict[str, Any]:
     seed_out_total = sum(e.transfer.amount_float for e in out_edges)
 
     findings: List[Dict[str, Any]] = []
+
+    # ---- 0. reported vs observed -----------------------------------------
+    reported = getattr(result.investigation, "reported_amount", None)
+    if reported and seed_out_total < reported * 0.95:
+        findings.append(
+            {
+                "severity": "info",
+                "type": "coverage",
+                "title": "Only part of the reported amount is traceable here",
+                "detail": (
+                    f"{_fmt_amt(reported)} {_native(result)} was reported, but only "
+                    f"{_fmt_amt(seed_out_total)} left this wallet within the traced "
+                    f"window ({seed_out_total / reported * 100:.0f}%). The remainder "
+                    f"may have moved before the incident time, through a different "
+                    f"wallet, or in a token/chain not covered by this trace. All "
+                    f"percentages below are shares of the REPORTED amount."
+                ),
+                "addresses": [seed_norm],
+                "metrics": {
+                    "reported_amount": reported,
+                    "observed_outflow": round(seed_out_total, 2),
+                    "coverage_pct": round(seed_out_total / reported * 100, 1),
+                },
+            }
+        )
 
     # ---- 1. dispersal / structuring bursts (from fan-out detections) -------
     for d in result.pattern_detections.get("fan_out", []):
@@ -125,13 +149,32 @@ def build_case_summary(result: InvestigationResult) -> Dict[str, Any]:
         )
 
     # ---- 3. convergence / consolidation points --------------------------
+    # A convergence point is either (a) many distinct senders, or (b) fewer
+    # senders BUT holding a material share of the traced funds. Sender count
+    # alone at the threshold is weak evidence; value corroborates it.
+    def _is_convergence(addr: str, n_src: int) -> bool:
+        if addr == seed_norm:
+            return False
+        if n_src >= cfg.convergence_min_senders:
+            return True
+        node = g.nodes.get(addr)
+        taint = node.taint_fraction if node else 0.0
+        return (
+            n_src >= cfg.convergence_min_senders_with_value
+            and taint >= cfg.convergence_material_taint
+        )
+
     collectors = sorted(
         (
             (addr, len(srcs), recv_amt[addr])
             for addr, srcs in recv_from.items()
-            if len(srcs) >= CONVERGENCE_MIN_SENDERS and addr != seed_norm
+            if _is_convergence(addr, len(srcs))
         ),
-        key=lambda x: (x[1], x[2]),
+        # rank by money first, then by how many wallets funnelled in
+        key=lambda x: (
+            g.nodes[x[0]].taint_fraction if x[0] in g.nodes else 0.0,
+            x[1],
+        ),
         reverse=True,
     )
     lead_rows: List[Dict[str, Any]] = []
@@ -170,6 +213,7 @@ def build_case_summary(result: InvestigationResult) -> Dict[str, Any]:
                 },
             }
         )
+        conv_taint = node.taint_fraction if node else 0.0
         lead_rows.append(
             {
                 "address": addr,
@@ -177,11 +221,105 @@ def build_case_summary(result: InvestigationResult) -> Dict[str, Any]:
                     f"{label} ({etype})"
                     if verified
                     else f"convergence of {n_src} traced wallets (unverified)"
+                    + (
+                        f"; {conv_taint * 100:.1f}% of traced funds arrived here"
+                        if conv_taint > 0
+                        else ""
+                    )
                 ),
-                "score": round(min(0.75, 0.35 + 0.05 * n_src), 2)
-                if not verified
-                else 0.85,
+                "score": 0.85
+                if verified
+                else round(min(0.80, 0.12 + 0.03 * n_src + 0.55 * conv_taint), 2),
                 "verified": verified,
+                "taint_fraction": conv_taint,
+            }
+        )
+
+    # ---- 3b. layering chain along the money path ------------------------
+    # peel + rapid forwarding over consecutive hops IS the layering signature.
+    # One finding for the whole chain beats five disconnected flags.
+    peel_addrs = {d["address"] for d in result.pattern_detections.get("peel_behavior", [])}
+    fast = {
+        d["address"]: d["received_to_forwarded_seconds"]
+        for d in result.pattern_detections.get("hop_velocity", [])
+    }
+    top_taint = max(
+        (n for a, n in g.nodes.items() if a != seed_norm),
+        key=lambda n: n.taint_fraction,
+        default=None,
+    )
+    if top_taint is not None and top_taint.taint_fraction > 0:
+        chain = dominant_path(g, seed_norm, top_taint.address.address)
+        hops = [a for a in chain[1:-1] if a in peel_addrs or a in fast]
+        if len(chain) >= 4 and len(hops) >= 2:
+            gaps = [fast[a] for a in chain[1:-1] if a in fast]
+            retained = top_taint.taint_fraction * 100
+            findings.append(
+                {
+                    "severity": "high",
+                    "type": "layering",
+                    "title": f"Layering chain across {len(chain) - 1} hops",
+                    "detail": (
+                        f"Funds moved {seed_norm[:10]}... -> "
+                        + " -> ".join(a[:8] + "..." for a in chain[1:])
+                        + f". {len(hops)} of the intermediate wallets forwarded "
+                        f"promptly and/or peeled a small amount, retaining "
+                        f"{retained:.1f}% of the traced value to the end of the "
+                        f"chain"
+                        + (
+                            f" (fastest hop {_dur(min(gaps))})."
+                            if gaps
+                            else "."
+                        )
+                        + " Consistent with deliberate layering to break the trail."
+                    ),
+                    "addresses": chain,
+                    "metrics": {
+                        "hops": len(chain) - 1,
+                        "pass_through_hops": len(hops),
+                        "value_retained_pct": round(retained, 2),
+                        "fastest_hop_seconds": min(gaps) if gaps else None,
+                    },
+                }
+            )
+
+    # ---- 3c. behavioural wallet types (label-independent, UNVERIFIED) ----
+    profiles = getattr(result, "wallet_profiles", {}) or {}
+    _BEHAVIOUR_TITLES = {
+        "exchange_deposit": "Likely exchange deposit infrastructure",
+        "collector": "Consolidation point",
+        "distributor": "Dispersal hub",
+        "pass_through": "Pass-through wallet",
+    }
+    ranked = sorted(
+        (
+            (a, p)
+            for a, p in profiles.items()
+            if p["behavior"] in _BEHAVIOUR_TITLES
+        ),
+        key=lambda kv: (
+            kv[1]["confidence"],
+            g.nodes[kv[0]].taint_fraction if kv[0] in g.nodes else 0.0,
+        ),
+        reverse=True,
+    )
+    for addr, prof in ranked[:5]:
+        node = g.nodes.get(addr)
+        taint = node.taint_fraction if node else 0.0
+        findings.append(
+            {
+                "severity": "high" if prof["behavior"] == "exchange_deposit" else "medium",
+                "type": "behaviour",
+                "title": f"{_BEHAVIOUR_TITLES[prof['behavior']]}: {addr[:10]}...",
+                "detail": (
+                    f"{addr} - {'; '.join(prof['signals'])}. "
+                    f"{taint * 100:.1f}% of the traced funds passed through here. "
+                    f"UNVERIFIED behavioural classification "
+                    f"(confidence {prof['confidence']:.2f}) - corroborate off-chain "
+                    f"before acting."
+                ),
+                "addresses": [addr],
+                "metrics": {**prof["metrics"], "behavior": prof["behavior"]},
             }
         )
 
@@ -211,16 +349,34 @@ def build_case_summary(result: InvestigationResult) -> Dict[str, Any]:
             )
 
     # ---- 5. scored endpoints become leads ------------------------------
-    for ep in result.candidate_endpoints[:5]:
-        lead_rows.append(
-            {
-                "address": ep.address.address,
-                "reason": "; ".join(ep.evidence[:2]) or "scored endpoint",
-                "score": round(ep.confidence_score, 2),
-                "verified": ep.address.entity_type.value
-                in ("exchange", "sanctioned"),
-            }
-        )
+    # Lead priority is driven by how much of the victim's money actually got
+    # there, softened by how identifiable the wallet is. A wallet holding 79% of
+    # the funds with unknown ownership outranks a weak convergence hit.
+    by_addr = {r["address"]: r for r in lead_rows}
+    for ep in result.candidate_endpoints[:8]:
+        verified = ep.address.entity_type.value in ("exchange", "sanctioned")
+        priority = round(0.70 * ep.taint_fraction + 0.30 * ep.entity_confidence, 2)
+        bits = [f"{ep.taint_fraction * 100:.1f}% of traced funds arrived here"]
+        if ep.address.label:
+            bits.append(f"labelled {ep.address.label}")
+        elif ep.is_terminal:
+            bits.append("trail ends here - unidentified, priority KYC/subpoena target")
+        bits.append(f"{ep.hop_count} hop(s) from the seed")
+        row = {
+            "address": ep.address.address,
+            "reason": "; ".join(bits),
+            "score": priority,
+            "verified": verified,
+            "taint_fraction": ep.taint_fraction,
+            "flow_confidence": ep.flow_confidence,
+            "entity_confidence": ep.entity_confidence,
+        }
+        prev = by_addr.get(row["address"])
+        if prev is None:
+            lead_rows.append(row)
+            by_addr[row["address"]] = row
+        elif priority > prev["score"]:
+            prev.update(row)
 
     # Fallback leads: if nothing labelled or converged, the highest-value wallets
     # on the un-expanded frontier are where the investigation should go next.
@@ -251,7 +407,10 @@ def build_case_summary(result: InvestigationResult) -> Dict[str, Any]:
 
     sev_rank = {"high": 0, "medium": 1, "low": 2, "info": 3}
     findings.sort(key=lambda f: sev_rank.get(f["severity"], 9))
-    lead_rows.sort(key=lambda x: x["score"], reverse=True)
+    # "Where do I look first?" is answered by the money, then by the score.
+    lead_rows.sort(
+        key=lambda x: (x.get("taint_fraction", 0.0), x["score"]), reverse=True
+    )
 
     headline = _headline(result, findings, seed_out_total, frontier_value)
 
@@ -333,7 +492,27 @@ def _headline(result, findings, seed_out, frontier) -> str:
         )
     if hits:
         parts.append(f"Path reaches a labelled {hits[0]['metrics']['entity_type']}.")
-    if not conv and not hits:
+
+    # Where did the money actually concentrate? This works with zero labels.
+    eps = getattr(result, "candidate_endpoints", []) or []
+    top = max(eps, key=lambda e: e.taint_fraction, default=None)
+    if top is not None and top.taint_fraction > 0:
+        who = top.address.label or f"{top.address.address[:10]}..."
+        basis = (
+            "the reported amount"
+            if getattr(result.investigation, "reported_amount", None)
+            else "the traced funds"
+        )
+        parts.append(
+            f"{top.taint_fraction * 100:.0f}% of {basis} "
+            f"({_fmt_amt(top.tainted_value)} {tok}) concentrated at {who}"
+            + (
+                " where the trail ends - highest-priority lead."
+                if top.is_terminal and not top.address.label
+                else "."
+            )
+        )
+    elif not conv and not hits:
         parts.append(
             f"No labelled endpoint reached; {_fmt_amt(frontier)} {tok} left the "
             "observed window across un-expanded wallets."

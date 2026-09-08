@@ -175,7 +175,7 @@ def write_synthetic_data():
 
     sanctions_dir = Path(__file__).parent.parent / "data" / "sanctions"
     sanctions_dir.mkdir(parents=True, exist_ok=True)
-    with open(sanctions_dir / "ofac_sdn.json", "w") as f:
+    with open(sanctions_dir / "synthetic_sanctions.json", "w") as f:
         json.dump(SANCTIONS, f, indent=2)
 
     entities_dir = Path(__file__).parent.parent / "data" / "entities"

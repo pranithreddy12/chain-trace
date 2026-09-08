@@ -21,6 +21,13 @@ class GraphNode(BaseModel):
     is_endpoint: bool = False
     is_suspicious: bool = False
     is_obfuscation_point: bool = False
+    # taint = how much of the SEED's money reached this wallet (haircut model)
+    tainted_value: float = 0.0
+    taint_fraction: float = 0.0
+    # label-independent behavioural verdict (UNVERIFIED, Tier-3/4)
+    behavior: Optional[str] = None
+    behavior_confidence: float = 0.0
+    behavior_signals: List[str] = Field(default_factory=list)
 
     @property
     def display_id(self) -> str:
@@ -33,6 +40,8 @@ class GraphEdge(BaseModel):
     is_highlighted: bool = False
     is_suspicious: bool = False
     path_rank: Optional[int] = None
+    # portion of the seed's tainted value carried by this transfer
+    tainted_value: float = 0.0
 
 
 class TransactionGraph(BaseModel):

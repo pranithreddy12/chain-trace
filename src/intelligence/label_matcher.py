@@ -114,6 +114,14 @@ class LabelMatcher:
             pass
         return count
 
+    def all_entries(self) -> List[Dict]:
+        """Every loaded label as {address, chain, label, category, source, confidence}."""
+        out = []
+        for key, data in self._labels_cache.items():
+            chain, _, addr = key.partition(":")
+            out.append({"address": addr, "chain": chain, **data})
+        return out
+
     def get_all_labeled_addresses(self, chain: Chain) -> List[Dict]:
         results = []
         prefix = f"{chain.value}:"

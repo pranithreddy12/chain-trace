@@ -400,3 +400,191 @@ Self-contained HTML/JS via `st.components.v1.html`, running **force-graph**
 - Run: `uvicorn api.main:app --reload --port 8000` + `npm run dev` in `web/`,
   open localhost:5173.
 - Do NOT modify `app/streamlit_app.py` or `src/`.
+
+## 2026-09-08 — Investigation core: taint propagation + two-axis scoring
+Problem: the ranking layer was gated behind entity labels, so unlabelled chains
+(all of Tron) produced ZERO candidate endpoints. One blended score also conflated
+"did the money go here" with "what is this address", so a wallet holding most of
+the stolen funds with unknown ownership scored below a labelled exchange that
+received a trickle.
+
+- NEW `src/analysis/taint.py` — `propagate_taint(graph, seed_addr, origin_amount=None)`
+  (haircut model: taint splits across outgoing transfers proportional to value;
+  a wallet can't forward more taint than value it moved; unforwarded taint is
+  retained). Runs in BFS-depth order and only feeds forward, so cycles terminate;
+  back/side edges are credited but not re-propagated (documented limitation).
+  Also `dominant_path(graph, seed, target)` — walks back along the highest-taint
+  inbound edge, i.e. the path the MONEY took, not the topologically shortest.
+  Writes `tainted_value` / `taint_fraction` onto nodes and `tainted_value` onto
+  edges. 9 unit tests in `tests/unit/test_taint.py`.
+- `investigation_service.run_investigation` calls `propagate_taint` after pattern
+  detection, before path analysis.
+- `path_analyzer.find_candidate_endpoints` UN-GATED: a candidate is now labelled
+  exchange/sanctioned OR `is_endpoint` OR terminal-in-window holding >=
+  `min_endpoint_taint_fraction` (0.01) of the seed's taint. Ranked by taint,
+  capped at `max_candidate_endpoints` (25). Uses `dominant_path` (falls back to
+  nx when there is no taint data, e.g. unit-test graphs). `amount_concentration`
+  is now the taint fraction when available.
+- `scoring.calculate` split into TWO AXES:
+  `flow_confidence = amount_concentration * (0.6 + 0.4*path_directness)` — taint
+  already accounts for splits, so directness only modulates (a long chain must
+  not be penalised twice); `entity_confidence = label tier only`.
+  `score = flow_weight*flow + (1-flow_weight)*entity`, mixer cap unchanged.
+  Reasons now include "X% of the reported funds reached this wallet (N traced)"
+  and, for unlabelled terminals, "priority target for off-chain KYC/subpoena".
+- `trace_service._bfs_trace` sorts transfers by amount desc before applying the
+  branch limit, so the limit keeps the money path rather than API ordering.
+- `case_summary`: headline leads with where the money concentrated; convergence
+  lead scores are taint-aware (4 senders at the detection threshold is weak on
+  its own); `recommended_leads` de-duplicated by address and ordered by
+  taint_fraction first.
+- `report_service` + Streamlit endpoints table expose flow / entity / taint.
+- FIXED: `scripts/seed_demo_data.py` was overwriting the real
+  `data/sanctions/ofac_sdn.json` with a single synthetic entry every run — it now
+  writes `synthetic_sanctions.json`. The 6-entry OFAC set was restored.
+
+RESULT — real unlabelled Tron trace `TDqSquXBgUCLYvYC4XZgrprLK589dkhSCf`
+(depth 2): **0 candidate endpoints -> 6 ranked leads.** Top lead
+`TMGVMEVG22QFiunnEUAeejSr8TragM281k`: 34% of traced funds (249,992 USDT) arrived
+and the trail ends there; flow 63% / entity 0% = "the money is here, owner
+unknown - priority KYC/subpoena target". Synthetic case still 8/8, Binance
+endpoint 73.0% (flow 66% / entity 85%). 46 tests pass (37 + 9 new).
+
+## 2026-09-08 — Behavioural classifier, layering narrative, data-driven mixers
+Follow-on to the taint/two-axis work. Closes weakness items 2, 4, 6, 7.
+
+- NEW `src/intelligence/behavior_classifier.py` — label-independent wallet
+  typing. `classify_wallets(graph, pattern_detections)` returns a `WalletProfile`
+  per wallet: `exchange_deposit | collector | distributor | pass_through |
+  holding`. EVERY type requires >= 2 independent signals (this IS the multi-signal
+  corroboration from item 6 — there is no separate layer). Confidence capped at
+  0.60 so it can never outrank a real label; wording always says UNVERIFIED.
+  The strongest label-free signal is the SHARED SWEEP DESTINATION: N traced
+  wallets each forwarding ~100% of their outflow to the same address is the
+  on-chain shape of exchange deposit infrastructure and needs no external data.
+  6 unit tests, including a negative test that a lone sweeper is NOT asserted.
+- `investigation_service._classify_behaviour` runs after taint (it needs taint
+  fractions) and before path analysis (it can promote wallets to endpoints).
+  Only `exchange_deposit` sets an entity claim — `EXCHANGE` +
+  `LabelSource.SWEEP_INFERENCE` at the profile confidence, which scoring already
+  maps to entity_confidence 0.60. All other types are context, never ownership.
+- `case_summary` gained two finding types:
+  * `layering` — walks the dominant (taint) path and, when >= 2 intermediate hops
+    show peel and/or fast-forwarding, emits ONE finding for the whole chain with
+    the hop list, % value retained and fastest hop. Replaces scattered flags.
+  * `behaviour` — one finding per classified wallet with its firing signals.
+- `mixer_bridge_detector` is now DATA-DRIVEN: reads `mixer` / `bridge` categories
+  from the loaded entity datasets via the new `LabelMatcher.all_entries()`, so
+  coverage is multichain and extendable through
+  `data/entities/mixers_bridges.json` without touching code. It also now flags by
+  ADDRESS, not only by token_contract (the old version could only catch a mixer
+  if it appeared as a token contract, which is rarely how it shows up).
+  Removed a placeholder "Multichain" address from the old hard-coded set that
+  looked fabricated (sequential hex) — never ship an address we cannot source.
+
+RESULT — real Tron trace `TDqSquXBgU...` depth 2: 77 wallets typed as
+9 pass_through / 3 distributor / 7 holding; headline now leads with
+"65% of the traced funds (451,292 USDT) concentrated at TAhqszzaku... where the
+trail ends". The classifier correctly DECLINED to assert any exchange_deposit at
+depth 2 — the sweep destinations sit at depth 3, so the shared-destination signal
+cannot fire. That is the guardrail working, not a miss.
+CONFIRMED at depth 3 (max_branches 8, 188 wallets): 13 pass_through /
+18 distributor / 6 exchange_deposit / 7 holding. The 6 exchange-deposit
+candidates each fired both required signals, e.g.
+`TNmtvHBUrHBRujaoUzfgegAiXyr6Rx8d1m` - "forwards 100% of its outflow to a single
+destination" + "that destination is also swept to by 5 other traced wallets"
+(conf 0.45, UNVERIFIED). That is the spec's Tier-3 sweep inference working on
+real Tron data with ZERO entity labels. Depth 2 finds none because the sweep
+destinations sit at depth 3 - so run demos at depth >= 3 to show this.
+52 tests pass (46 + 6 new); synthetic still 8/8 at 73.0%.
+
+## 2026-09-08 — Case anchoring + convergence tuning (closes the weakness list)
+- `trace()` / `run_investigation()` accept `incident_time` and `reported_amount`,
+  both persisted on `Investigation`.
+- PER-HOP time filtering, not just a global cutoff: the BFS queue carries
+  `(address, depth, not_before)`, and `not_before` for each hop is the timestamp
+  at which the tainted funds ARRIVED at that wallet. Money cannot leave a wallet
+  before it got there, so outflows predating arrival are excluded and a warning
+  is recorded. This is a real forensic correctness fix, not just noise control.
+- `reported_amount` anchors `propagate_taint(origin_amount=...)`, so taint
+  fractions are shares of the reported sum instead of the wallet's lifetime
+  outflow (which unrelated legitimate sends would otherwise dilute).
+- NEW `coverage` finding (info): when observed outflow < 95% of the reported
+  amount, it states plainly what share of the reported sum is traceable in this
+  window and why the rest might not be. Headline switches to "% of the reported
+  amount" when anchored so the basis is never ambiguous.
+- Convergence (#8) tuned and moved to settings: `convergence_min_senders` (4),
+  `convergence_min_senders_with_value` (3), `convergence_material_taint` (0.05).
+  Qualifies on sender count alone OR fewer senders + material taint — sender
+  count at the bare threshold was weak evidence on its own. Ranked by taint first.
+- Streamlit form gained optional "Incident date" / "Reported amount stolen".
+- 4 new tests (`tests/unit/test_case_anchoring.py`) including the per-hop rule
+  and a negative test that no incident_time keeps everything.
+
+VERIFIED on real data (`TDqSquXBgU...`, depth 2): unanchored 13 wallets /
+9 endpoints; anchored to 2026-09-01 with 50k reported -> 12 wallets / 6
+endpoints, pre-incident transfers skipped at 7 wallets, and the coverage finding
+correctly reports "50,000 reported but only 16,341 left this wallet within the
+traced window (33%)".
+
+STATE: 56 tests pass, synthetic 8/8 at 73.0%. The entire OPUS_BRIEF weakness list
+(#2-#8) is now closed; #1 (real Tron/ETH entity datasets) remains as a
+data-sourcing task, deliberately NOT done by hand — see data/entities/README.md.
+
+### Blank-graph bug #2 (fixed) — big graphs only
+`fitView` called `Graph.zoomToFit(400, ...)` on a **280ms interval**, so every
+zoom tween was cancelled before finishing. On a small graph it converged
+anyway; at ~110 nodes it stalled at zoom 0.83 instead of 2.25, leaving a
+sub-pixel clump in a corner that reads as an empty canvas. Three fixes in
+`app/graph_view.py`:
+1. fit tween duration is now a parameter defaulting to 0 (must stay < the
+   settling interval).
+2. dropped the `zoom < 0.5` floor to 0.05 — clamping the fit pushed big
+   graphs off-screen.
+3. min on-screen node radius in `nodeCanvasObject` using the `scale` arg, so
+   stars stay visible at any zoom instead of shrinking below a pixel.
+Also removed the `centerAt()` that ran concurrently with `zoomToFit` and
+fought it. Verified at 110 nodes in both flow and free-layout modes.
+NOTE: the earlier dagMode/`fx`-pin/NaN theory was **disproven** by
+measurement (force-graph clears `fx` itself); the `isFinite` guards added for
+it are harmless but were not the cause.
+
+### Confidence-coloured suspects + demo case
+`app/graph_view.py` now colours suspect wallets by confidence instead of a flat
+red. Ranked wallets use their `recommended_leads` score; unranked suspects get
+a derived score from taint fraction, behaviour confidence and pattern count
+(capped 0.80). Entity facts (seed, exchange, sanctioned, mixer, bridge,
+contract) keep their own colours — those are evidence, not scores. The number
+is always spelled out in the tooltip/panel ("lead confidence" vs "signal
+strength") so colour is never the only assertion.
+
+`src/demo/scenario.py` is a fabricated laundering case (structuring → rapid
+sweep → peel → convergence → Binance) fed through the REAL pipeline via a
+`DemoProvider` patched into `TraceEngine._get_provider`. No API key, no
+network. "🎬 Demo case" button in the Streamlit form; a banner states the data
+is fabricated. Only the Binance hot wallet is a real address, included so
+entity matching is exercised. Covered by `tests/unit/test_demo_scenario.py`.
+
+### Demo case expanded to a full showcase (+ two real bugs it exposed)
+`src/demo/scenario.py` now runs a 23-wallet, 6-hop laundering case through the
+production pipeline: 250,000 USDT -> 8 mules (structuring) -> 2 consolidation
+wallets (rapid sweep + convergence) -> peel chain / Tornado Cash / OFAC-Lazarus
+-> 4 unlabelled deposit wallets that all sweep to one funnel -> Binance.
+Includes a pre-incident transfer that the date filter must drop.
+`DEMO_WALKTHROUGH` is rendered in the app as a hop-by-hop explainer.
+
+Two production bugs the demo surfaced, both fixed in
+`src/application/investigation_service.py`:
+1. **Tier-3 promoted to a hard label.** An `exchange_deposit` behavioural
+   verdict was setting `entity_type = EXCHANGE` + `node_type = EXCHANGE`. A
+   mule sweeping into a layering wallet is shape-identical to a deposit wallet
+   sweeping into an exchange, so this typed all 8 mules as exchanges and
+   emitted 12 bogus "path reaches exchange" findings. Behaviour now only marks
+   the node a lead; the verdict stays in the `behavior*` fields. Findings on
+   the demo case dropped 28 -> 16.
+2. **`_analyze_paths` erased entity types.** It reset every endpoint's
+   `node_type` to UNKNOWN unless it was an exchange, silently discarding
+   SANCTIONED and MIXER classifications - so an OFAC hit rendered as an
+   anonymous grey wallet. Now maps exchange/sanctioned/mixer/bridge.
+Also: the seed keeps its green colour even after fan-out retypes it
+`suspicious_wallet`. Regression tests in `tests/unit/test_demo_scenario.py`.

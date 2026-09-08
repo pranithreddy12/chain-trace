@@ -56,6 +56,41 @@ class Settings(BaseSettings):
         "tokens with inflated nominal amounts; no legit ETH/USDT transfer "
         "exceeds ~1e9 units)",
     )
+    min_endpoint_taint_fraction: float = Field(
+        default=0.01,
+        ge=0.0,
+        le=1.0,
+        description="A terminal wallet must hold at least this share of the "
+        "seed's tainted value to count as a candidate endpoint",
+    )
+    max_candidate_endpoints: int = Field(
+        default=25, ge=1, description="Cap on ranked candidate endpoints"
+    )
+    convergence_min_senders: int = Field(
+        default=4,
+        ge=2,
+        description="Distinct in-graph senders needed to call a wallet a "
+        "convergence point on sender count alone",
+    )
+    convergence_min_senders_with_value: int = Field(
+        default=3,
+        ge=2,
+        description="Lower sender bar when the wallet also holds a material "
+        "share of the traced funds (two weak signals corroborate)",
+    )
+    convergence_material_taint: float = Field(
+        default=0.05,
+        ge=0.0,
+        le=1.0,
+        description="Taint share that makes a convergence point material",
+    )
+    flow_weight: float = Field(
+        default=0.65,
+        ge=0.0,
+        le=1.0,
+        description="Weight of flow confidence (did the money go here) in the "
+        "combined lead score; entity weight is 1 - this",
+    )
     peel_forward_ratio_min: float = Field(
         default=0.7,
         ge=0.0,

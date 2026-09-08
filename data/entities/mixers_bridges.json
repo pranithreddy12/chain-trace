@@ -1,0 +1,26 @@
+[
+  {
+    "address": "0x910Cbd523D972eb0a6f4cAe4618aD62622b39DbF",
+    "chain": "ethereum",
+    "label": "Tornado Cash: 10 ETH",
+    "category": "mixer",
+    "source": "ofac_sdn",
+    "confidence": 1.0
+  },
+  {
+    "address": "0xA160cdAB225685dA1d56aa342Ad8841c3b53f291",
+    "chain": "ethereum",
+    "label": "Tornado Cash: 100 ETH",
+    "category": "mixer",
+    "source": "ofac_sdn",
+    "confidence": 1.0
+  },
+  {
+    "address": "0x3ee18B2214AFF97000D974cf647E7C347E8fa585",
+    "chain": "ethereum",
+    "label": "Wormhole Token Bridge",
+    "category": "bridge",
+    "source": "curated_public",
+    "confidence": 0.70
+  }
+]
