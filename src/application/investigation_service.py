@@ -9,7 +9,7 @@ from ..domain.models.investigation import (
 from ..domain.models.graph import TransactionGraph, GraphNode
 from ..domain.models.address import Address
 from ..domain.models.transfer import Transfer
-from ..domain.enums import Chain, EntityCategory, NodeType, LabelSource
+from ..domain.enums import TraceMode, Chain, EntityCategory, NodeType, LabelSource
 from ..application.trace_service import TraceEngine, trace_funds
 from ..intelligence.label_matcher import LabelMatcher
 from ..intelligence.exchange_inference import ExchangeInference
@@ -46,6 +46,7 @@ class InvestigationService:
         token_filter: Optional[str] = None,
         incident_time: Optional[datetime] = None,
         reported_amount: Optional[float] = None,
+        mode: TraceMode = TraceMode.FORENSIC,
     ) -> InvestigationResult:
         result = await self.trace_engine.trace(
             seed_address,
@@ -55,6 +56,7 @@ class InvestigationService:
             token_filter,
             incident_time=incident_time,
             reported_amount=reported_amount,
+            mode=mode,
         )
 
         await self._enrich_with_intelligence(result)

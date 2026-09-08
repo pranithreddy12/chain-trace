@@ -14,6 +14,7 @@ from ..domain.models.investigation import (
 )
 from ..domain.models.graph import TransactionGraph, GraphNode, GraphEdge
 from ..domain.enums import (
+    TraceMode,
     Chain,
     EntityCategory,
     NodeType,
@@ -97,6 +98,7 @@ class TraceEngine:
         token_filter: Optional[str] = None,
         incident_time: Optional[datetime] = None,
         reported_amount: Optional[float] = None,
+        mode: TraceMode = TraceMode.FORENSIC,
     ) -> InvestigationResult:
         seed_address = (
             seed_address.lower() if chain.is_evm else seed_address
@@ -133,7 +135,10 @@ class TraceEngine:
         ctx.queue.append((seed_address, 0, _naive_utc(incident_time)))
 
         try:
-            await self._bfs_trace(ctx, max_depth, max_branches, token_filter)
+            if mode == TraceMode.ACTIVITY:
+                await self._activity_trace(ctx, token_filter)
+            else:
+                await self._bfs_trace(ctx, max_depth, max_branches, token_filter)
             cut = getattr(provider, "truncated_addresses", None)
             # isinstance, not truthiness: a provider double may expose
             # anything under that name
@@ -188,6 +193,67 @@ class TraceEngine:
         )
         return result
 
+    async def _activity_trace(
+        self, ctx: TraceContext, token_filter: Optional[str]
+    ) -> None:
+        """Full activity: every transfer in and out of the seed, then the same
+        for each of its direct counterparties. No branch limit - the point of
+        this mode is completeness, so anything we skip must be reported, never
+        quietly dropped.
+
+        Deliberately NOT the forensic traversal: there is no taint ordering and
+        no incident-time filter here. This describes the wallet; it does not
+        follow the money.
+        """
+        deadline = time.monotonic() + ctx.settings.trace_time_budget_seconds
+        seed = ctx.investigation.seed_address
+
+        counterparties = await self._absorb_activity(ctx, seed, token_filter, depth=0)
+
+        pending = [a for a in counterparties if a != seed]
+        for i, addr in enumerate(pending):
+            if time.monotonic() > deadline:
+                ctx.investigation.warnings.append(
+                    f"Trace time budget "
+                    f"({ctx.settings.trace_time_budget_seconds}s) reached - "
+                    f"{len(pending) - i} of {len(pending)} counterparties were "
+                    f"not expanded"
+                )
+                ctx.truncated = True
+                break
+            await self._absorb_activity(ctx, addr, token_filter, depth=1)
+
+    async def _absorb_activity(
+        self,
+        ctx: TraceContext,
+        address: str,
+        token_filter: Optional[str],
+        depth: int,
+    ) -> set:
+        """Fetch every transfer touching `address` and fold it into the graph.
+
+        Returns the counterparties seen. Unlike the forensic path this keeps
+        BOTH directions, so the node created is whichever side is not
+        `address` itself.
+        """
+        transfers = await self._get_transfers(
+            ctx, address, token_filter, both_directions=True
+        )
+        ctx.investigation.transactions_examined += len(transfers)
+        ctx.visited.add(address)
+
+        seen = set()
+        for transfer in transfers:
+            frm, to = transfer.normalized_from(), transfer.normalized_to()
+            other = to if frm == address else frm
+            if other == address:
+                continue  # self-transfer: an edge, but not a counterparty
+            seen.add(other)
+            if other not in ctx.graph.nodes:
+                await self._get_or_create_address(ctx, other, depth + 1)
+            ctx.graph.add_edge(GraphEdge(transfer=transfer))
+        return seen
+
     async def _bfs_trace(
         self,
         ctx: TraceContext,
@@ -210,7 +276,7 @@ class TraceEngine:
             if depth >= max_depth:
                 continue
 
-            transfers = await self._get_outgoing_transfers(
+            transfers = await self._get_transfers(
                 ctx, current_address, token_filter, not_before
             )
 
@@ -250,12 +316,13 @@ class TraceEngine:
                 if is_new_node:
                     new_nodes += 1
 
-    async def _get_outgoing_transfers(
+    async def _get_transfers(
         self,
         ctx: TraceContext,
         address: str,
         token_filter: Optional[str],
         not_before: Optional[datetime] = None,
+        both_directions: bool = False,
     ) -> List[Transfer]:
         normalized = (
             address.lower() if ctx.investigation.chain.is_evm else address
@@ -272,6 +339,10 @@ class TraceEngine:
                 coro = ctx.provider.get_token_transfers(
                     address, contract_address=token_filter
                 )
+            elif both_directions:
+                coro = ctx.provider.get_all_transfers(
+                    address, max_pages=3, offset=100
+                )
             else:
                 coro = ctx.provider.get_all_outgoing_transfers(
                     address, max_pages=3, offset=100
@@ -282,7 +353,17 @@ class TraceEngine:
 
             # Guard against providers returning transfers not originating from
             # the queried address (keeps branch limits meaningful).
-            transfers = [t for t in transfers if t.normalized_from() == normalized]
+            if not both_directions:
+                # forensic mode follows money OUT of this address; anything the
+                # provider returns that did not originate here is noise
+                transfers = [t for t in transfers if t.normalized_from() == normalized]
+            else:
+                # activity mode keeps both directions, but the address must be
+                # one side of the transfer
+                transfers = [
+                    t for t in transfers
+                    if normalized in (t.normalized_from(), t.normalized_to())
+                ]
 
             # Unusable amounts (unparseable or negative) are reported
             # separately from scam tokens: they mean the provider sent us

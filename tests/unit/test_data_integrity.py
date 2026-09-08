@@ -308,3 +308,85 @@ class TestTruncationIsDisclosed:
             assert any("time budget" in w for w in r.investigation.warnings)
         finally:
             settings.trace_time_budget_seconds = original
+
+
+class TestTraceModes:
+    """Activity mode describes the wallet; forensic mode follows the money."""
+
+    def _service_and_provider(self):
+        from unittest.mock import Mock, AsyncMock
+        from src.domain.enums import TransferDirection
+
+        incoming = _transfer("0xfunder", "0xseed", 900)
+        object.__setattr__(incoming, "direction", TransferDirection.INCOMING)
+        every = {
+            "0xseed": [
+                _transfer("0xseed", "0xa", 100),
+                _transfer("0xseed", "0xb", 50, minutes=1),
+                incoming,
+            ],
+            "0xa": [_transfer("0xa", "0xc", 90, minutes=5)],
+            "0xb": [],
+            "0xfunder": [incoming],
+        }
+        outgoing = {
+            k: [t for t in v if t.normalized_from() == k] for k, v in every.items()
+        }
+
+        p = Mock()
+        p.chain = Chain.ETHEREUM
+        p.truncated_addresses = set()
+
+        async def out(a, **kw):
+            return list(outgoing.get(a.lower(), []))
+
+        async def both(a, **kw):
+            return list(every.get(a.lower(), []))
+
+        p.get_all_outgoing_transfers = out
+        p.get_all_transfers = both
+        p.close = AsyncMock()
+        return p
+
+    def _run(self, mode):
+        import asyncio
+        from unittest.mock import patch
+        from src.application.investigation_service import InvestigationService
+
+        svc = InvestigationService()
+        with patch.object(
+            svc.trace_engine, "_get_provider", return_value=self._service_and_provider()
+        ):
+            return asyncio.run(
+                svc.run_investigation(
+                    "0xseed", Chain.ETHEREUM, max_depth=2, max_branches=25, mode=mode
+                )
+            )
+
+    def test_forensic_mode_ignores_incoming_funders(self):
+        from src.domain.enums import TraceMode
+
+        r = self._run(TraceMode.FORENSIC)
+        assert "0xfunder" not in r.graph.nodes
+        assert {"0xa", "0xb", "0xc"} <= set(r.graph.nodes)
+
+    def test_activity_mode_includes_who_funded_the_wallet(self):
+        from src.domain.enums import TraceMode
+
+        r = self._run(TraceMode.ACTIVITY)
+        assert "0xfunder" in r.graph.nodes, "activity mode must show inbound funds"
+
+    def test_activity_mode_reaches_counterparty_activity(self):
+        from src.domain.enums import TraceMode
+
+        r = self._run(TraceMode.ACTIVITY)
+        # 0xc is only reachable through the counterparty 0xa
+        assert "0xc" in r.graph.nodes
+
+    def test_default_mode_is_forensic(self):
+        import inspect
+        from src.application.investigation_service import InvestigationService
+        from src.domain.enums import TraceMode
+
+        sig = inspect.signature(InvestigationService.run_investigation)
+        assert sig.parameters["mode"].default == TraceMode.FORENSIC

@@ -12,7 +12,13 @@ from typing import Dict, List, Optional, Any
 import pandas as pd
 
 from src.config.settings import get_settings
-from src.domain.enums import Chain, EntityCategory, NodeType, InvestigationStatus
+from src.domain.enums import (
+    Chain,
+    EntityCategory,
+    NodeType,
+    InvestigationStatus,
+    TraceMode,
+)
 from src.domain.models.address import Address
 from src.application.investigation_service import InvestigationService
 from src.application.report_service import ReportService
@@ -76,6 +82,33 @@ def render_header():
 
 def render_input_form():
     st.markdown("## Investigation Input")
+
+    mode_label = st.radio(
+        "Mode",
+        options=[
+            "Investigation - follow the money",
+            "Full activity - everything this wallet did",
+        ],
+        horizontal=True,
+        help=(
+            "Investigation follows funds OUT of the wallet, hop by hop, ranked "
+            "by how much of the traced money reached each address. "
+            "Full activity describes the wallet instead: every transfer in and "
+            "out of it and of each direct counterparty, with no branch limit."
+        ),
+    )
+    mode = (
+        TraceMode.ACTIVITY
+        if mode_label.startswith("Full activity")
+        else TraceMode.FORENSIC
+    )
+    if mode == TraceMode.ACTIVITY:
+        st.caption(
+            "Full activity covers the seed and its direct counterparties "
+            "(2 hops), in both directions, with no branch limit. Depth and "
+            "branch settings below do not apply. It is a description of the "
+            "wallet, not an attribution of funds."
+        )
 
     col1, col2, col3 = st.columns([3, 1, 1])
 
@@ -165,6 +198,7 @@ def render_input_form():
             else None
         ),
         "reported_amount": reported_amount if reported_amount > 0 else None,
+        "mode": mode,
         "trace_button": trace_button,
         "demo_button": demo_button,
     }
@@ -572,6 +606,7 @@ def main():
                         token_filter=input_data["token_filter"],
                         incident_time=input_data["incident_time"],
                         reported_amount=input_data["reported_amount"],
+                        mode=input_data["mode"],
                     )
                 )
                 st.session_state.investigation_result = result

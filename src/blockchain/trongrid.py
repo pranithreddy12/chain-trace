@@ -270,42 +270,41 @@ class TronGridProvider(BaseProvider):
         except ProviderError:
             return None
 
-    async def get_all_outgoing_transfers(
-        self, address: str, max_pages: int = 5, offset: int = 100
+    async def _paginate_all(
+        self, address: str, max_pages: int, offset: int, outgoing_only: bool
     ) -> List[Transfer]:
-        all_transfers = []
-
-        # TRC20 (USDT etc.) — paginate via TronGrid's opaque fingerprint token
-        fp = None
+        """One pagination path for both directions - the cap accounting and the
+        truncation signal must not drift between them."""
+        all_transfers: List[Transfer] = []
         exhausted = False
-        for _ in range(max_pages):
-            token = await self.get_token_transfers(
-                address, page=fp or 1, offset=offset
-            )
-            all_transfers.extend(
-                t for t in token if t.direction == TransferDirection.OUTGOING
-            )
-            fp = getattr(self, "_last_fingerprint", None)
-            if not fp or len(token) < offset:
-                break
-        else:
-            exhausted = True  # ran out of pages, not out of data
 
-        # Native TRX
-        fp = None
-        for _ in range(max_pages):
-            native = await self.get_native_transfers(
-                address, page=fp or 1, offset=offset
-            )
-            all_transfers.extend(
-                t for t in native if t.direction == TransferDirection.OUTGOING
-            )
-            fp = getattr(self, "_last_fingerprint", None)
-            if not fp or len(native) < offset:
-                break
-        else:
-            exhausted = True
+        def keep(items):
+            if not outgoing_only:
+                return items
+            return [t for t in items if t.direction == TransferDirection.OUTGOING]
+
+        for fetch in (self.get_token_transfers, self.get_native_transfers):
+            fp = None
+            for _ in range(max_pages):
+                page = await fetch(address, page=fp or 1, offset=offset)
+                all_transfers.extend(keep(page))
+                fp = getattr(self, "_last_fingerprint", None)
+                if not fp or len(page) < offset:
+                    break
+            else:
+                exhausted = True  # ran out of pages, not out of data
 
         if exhausted:
             self.truncated_addresses.add(address)
         return all_transfers
+
+    async def get_all_outgoing_transfers(
+        self, address: str, max_pages: int = 5, offset: int = 100
+    ) -> List[Transfer]:
+        return await self._paginate_all(address, max_pages, offset, True)
+
+    async def get_all_transfers(
+        self, address: str, max_pages: int = 5, offset: int = 100
+    ) -> List[Transfer]:
+        """Both directions - for the full-activity view of a wallet."""
+        return await self._paginate_all(address, max_pages, offset, False)

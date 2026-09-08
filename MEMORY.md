@@ -729,3 +729,25 @@ Testing note: do NOT patch `time.monotonic` to force a budget timeout -
 asyncio's event loop reads the same clock. Set the budget negative instead.
 
 Tests: 85 pass (3 new in TestTruncationIsDisclosed).
+
+### Two trace modes (TraceMode enum)
+`FORENSIC` (default, unchanged): outgoing only, branch-limited, incident-time
+filtered, ranked by taint. Answers "where did the stolen funds go".
+`ACTIVITY` (new): every transfer IN and OUT of the seed, then the same for each
+direct counterparty (2 hops), no branch limit, no incident filter. Answers
+"what has this wallet been doing, and with whom". Implemented as a separate
+`_activity_trace` / `_absorb_activity` rather than mode-flags inside the
+forensic BFS, so the forensic path cannot regress.
+Providers gained `get_all_transfers()` (both directions); the pagination and
+page-cap truncation accounting were refactored into one `_paginate_all()` per
+provider so the two directions cannot drift apart.
+Time budget and truncation reporting apply to BOTH modes.
+UI: a radio at the top of the form; activity mode notes that depth/branch
+settings do not apply.
+
+Incidental fix during that refactor: Etherscan's pagination used to `break` when
+a page contained no OUTGOING transfers, so a page of purely incoming activity
+ended the fetch early and hid later outgoing pages. It now breaks only when the
+provider returns nothing at all.
+
+Tests: 89 pass (4 new in TestTraceModes).

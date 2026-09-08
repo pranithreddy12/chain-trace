@@ -67,6 +67,20 @@ class TransferDirection(str, Enum):
     INCOMING = "incoming"
 
 
+class TraceMode(str, Enum):
+    """How the graph is built.
+
+    FORENSIC follows the MONEY: outgoing only, branch-limited, ranked by taint.
+    It answers "where did the stolen funds go".
+    ACTIVITY describes the WALLET: every transfer in and out of the seed and of
+    each of its direct counterparties, with no branch limit. It answers "what
+    has this wallet been doing, and with whom".
+    """
+
+    FORENSIC = "forensic"
+    ACTIVITY = "activity"
+
+
 class InvestigationStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
