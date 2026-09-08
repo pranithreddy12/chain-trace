@@ -588,3 +588,77 @@ Two production bugs the demo surfaced, both fixed in
    anonymous grey wallet. Now maps exchange/sanctioned/mixer/bridge.
 Also: the seed keeps its green colour even after fan-out retypes it
 `suspicious_wallet`. Regression tests in `tests/unit/test_demo_scenario.py`.
+
+### Deeper trace looked emptier than a shallow one (fixed)
+`fitView` framed only the "core" wallets (`zoomToFit(ms, 95, isCore)`), so any
+hop whose wallets were plain/unlabelled fell outside the fit and was clipped
+off the top and bottom of the canvas. On TJrsxY5goqk6nuXcGDUmtu28Wdma1o41Ur
+depth 2 looked complete (its core happened to span the graph) while depth 3
+looked sparser - even though the backend correctly returned MORE data
+(27 -> 37 nodes, nothing pruned; verified against the live API).
+Fix: always `zoomToFit` every node, padding 80 (<=60 nodes) / 55. Deleted the
+now-dead `isCore`, `CORE_N` and `coreCenter` helpers.
+Lesson: verify the backend before touching the renderer - "I see less" was a
+framing bug, not a traversal bug.
+
+### DATA AUDIT (2026-09-08) - ALL FOUR FIXED (see below)
+Probed with synthetic invariants + the live Tron trace
+TJrsxY5goqk6nuXcGDUmtu28Wdma1o41Ur (depth 3, 49 wallets, 88 edges).
+
+**BUG 1 (HIGH, confirmed on real data): cross-token value mixing.**
+`Transfer.amount_float` returns bare units with no token awareness, and
+`GraphNode.incoming_amount/outgoing_amount` sum them across tokens. The live
+trace carries TRX (5,691,041 units) + USDT (163,724 units) added into one
+number. `case_summary._native()` then stamps the most FREQUENT symbol on all
+sums, so the headline reads "42,290.16 USDT" for a TRX+USDT total.
+Impact measured: re-running `propagate_taint` over USDT edges only (dropping
+just 10 of 88 edges) changes leads #2-#5 entirely -
+  mixed:     TJDENsfBJs4R 97.1%, TDnaFCGkoPiF 47.7%, TCFpCtC2FaUw 12.1%
+  USDT-only: TVXxphhFQMAM 83.6%, TNihrHpUgEhA 10.0%, TYC9hQZjhaVh  3.3%
+#1 (TDqSquXBgUCLYvYC4XZg) is stable; everything below it is wrong.
+Fix options: per-token taint (no price data needed, correct, bigger change) or
+trace one token at a time. Do NOT sum units across tokens.
+
+**BUG 2 (MEDIUM): duplicate tx hashes double-counted.** `TransactionGraph.add_edge`
+does not dedupe on `transaction_hash`; adding the same hash twice yields 2
+edges and doubles the amount. 0 dups in the current trace, but paginated
+provider retries can produce them.
+
+**BUG 3 (MEDIUM): malformed amounts silently become 0.0.** `amount_float`
+swallows ValueError -> 0.0, creating a zero-value edge that still deflates
+taint with no warning. Should warn like the scam-token guard does.
+
+**BUG 4 (LOW): negative amounts pass through** (`"-500"` -> -500.0). Contained
+today only because trace_service filters `0 < amount_float < cap`.
+
+NOT bugs (checked, clean): taint conservation holds (haircut splits, never
+creates value); Tron TRX decimals correct (6); Tron base58 vs EVM lowercase
+normalization consistent; no self-transfers; scam-token cap works but at 1e9
+only stops uint256-max tokens, not a 100M-unit scam token.
+
+### Data audit fixes (all four landed)
+**Bug 1 - per-token taint.** `propagate_taint` now partitions edges by
+`token_symbol` and runs the haircut independently per token (each edge carries
+exactly one token, so the partition is exact). New `GraphNode` fields
+`taint_by_token`, `tainted_by_token`, `taint_token`; `taint_fraction` /
+`tainted_value` are the STRONGEST SINGLE-TOKEN share, never a cross-token sum.
+`origin_amount` (reported amount) anchors only the primary token - the one the
+seed moved in the most transfers - other tokens anchor on the seed's own
+outflow in them.
+`case_summary` is now denominated in ONE token: `_native()` returns the seed's
+dominant token (was: graph-wide most frequent, which stamped one name on a sum
+of several), every money aggregate filters to it, and a new `multi_token`
+finding discloses the other tokens and their totals instead of silently
+dropping them. All "% of the traced funds" wording now names the token.
+
+**Bug 2 - edge dedupe.** `TransactionGraph.add_edge` keys on
+(tx_hash, from, to, token, amount) via a `PrivateAttr` set. A batch payout
+sharing one hash across two recipients still yields two edges.
+
+**Bugs 3/4 - unusable amounts.** New `Transfer.amount_is_usable` (False for
+unparseable or <= 0). `trace_service` drops those FIRST and warns separately
+from the scam-token cap, so provider data problems are no longer invisible.
+
+Verified: 77 tests pass (10 new in `tests/unit/test_data_integrity.py`); demo
+ground truth unchanged; live Tron trace now reports every taint with its token
+and raises the multi-token finding.

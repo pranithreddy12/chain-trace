@@ -228,13 +228,25 @@ class TraceEngine:
             # the queried address (keeps branch limits meaningful).
             transfers = [t for t in transfers if t.normalized_from() == normalized]
 
+            # Unusable amounts (unparseable or negative) are reported
+            # separately from scam tokens: they mean the provider sent us
+            # something we could not read, which is a data-quality signal, not
+            # an attacker poisoning analytics. Both must be surfaced - silently
+            # treating them as zero deflates taint with no trace.
+            before = len(transfers)
+            transfers = [t for t in transfers if t.amount_is_usable]
+            unusable = before - len(transfers)
+            if unusable:
+                ctx.investigation.warnings.append(
+                    f"Dropped {unusable} transfer(s) for {address[:12]} with an "
+                    f"unreadable or negative amount (provider data issue)"
+                )
+
             # Drop scam / airdrop tokens: worthless TRC-20/ERC-20 tokens sent with
             # a uint256-max nominal amount to poison analytics.
             cap = self.settings.max_plausible_transfer_amount
             before = len(transfers)
-            transfers = [
-                t for t in transfers if 0 < t.amount_float < cap
-            ]
+            transfers = [t for t in transfers if t.amount_float < cap]
             dropped = before - len(transfers)
             if dropped:
                 ctx.investigation.warnings.append(

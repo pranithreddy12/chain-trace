@@ -105,6 +105,7 @@ def _classify_one(
     v_out = out_value.get(addr, 0.0)
     terminal = n_out == 0
     taint = node.taint_fraction
+    taint_tok = node.taint_token or "traced token"
     gap = turnaround.get(addr)
 
     dests = out_to.get(addr, {})
@@ -161,7 +162,7 @@ def _classify_one(
             else f"only {n_out} onward destination(s)"
         )
     if taint >= COLLECTOR_MIN_TAINT:
-        sig.append(f"holds {taint * 100:.1f}% of the traced funds")
+        sig.append(f"holds {taint * 100:.1f}% of the traced {taint_tok}")
     if len(sig) >= 2 and n_in >= COLLECTOR_MIN_SENDERS:
         candidates.append(
             WalletProfile(
@@ -204,7 +205,7 @@ def _classify_one(
     if terminal:
         sig.append("funds arrived and were not observed leaving")
     if taint >= HOLDING_MIN_TAINT:
-        sig.append(f"holds {taint * 100:.1f}% of the traced funds")
+        sig.append(f"holds {taint * 100:.1f}% of the traced {taint_tok}")
     if len(sig) >= 2:
         candidates.append(
             WalletProfile(

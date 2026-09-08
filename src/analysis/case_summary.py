@@ -28,16 +28,24 @@ def build_case_summary(result: InvestigationResult) -> Dict[str, Any]:
     seed = result.seed_address.address
     seed_norm = seed.lower() if result.seed_address.chain.is_evm else seed
 
-    out_edges = [e for e in g.edges if e.transfer.normalized_from() == seed_norm]
+    all_out = [e for e in g.edges if e.transfer.normalized_from() == seed_norm]
     all_ts = [e.transfer.timestamp for e in g.edges]
 
-    # per-address in/out aggregates over the observed graph
+    # Every figure below is in ONE token. Amounts in different tokens are not
+    # commensurable, so they are never added together; the primary token is the
+    # one the seed moved in the most transfers, matching the taint anchor.
+    primary = _native(result)
+    out_edges = [e for e in all_out if (e.transfer.token_symbol or "?") == primary]
+
+    # per-address in/out aggregates over the observed graph, primary token only
     recv_from: Dict[str, set] = defaultdict(set)
     recv_amt: Dict[str, float] = defaultdict(float)
     sent_amt: Dict[str, float] = defaultdict(float)
     for e in g.edges:
         f, t = e.transfer.normalized_from(), e.transfer.normalized_to()
         recv_from[t].add(f)
+        if (e.transfer.token_symbol or "?") != primary:
+            continue
         recv_amt[t] += e.transfer.amount_float
         sent_amt[f] += e.transfer.amount_float
 
@@ -52,6 +60,33 @@ def build_case_summary(result: InvestigationResult) -> Dict[str, Any]:
     seed_out_total = sum(e.transfer.amount_float for e in out_edges)
 
     findings: List[Dict[str, Any]] = []
+
+    # ---- 0a. other tokens are excluded, not ignored -----------------------
+    tok_totals = _token_totals(result)
+    others = {k: v for k, v in tok_totals.items() if k != primary and v > 0}
+    if others:
+        listed = ", ".join(
+            f"{_fmt_amt(v)} {k}" for k, v in sorted(others.items(), key=lambda kv: -kv[1])
+        )
+        findings.append(
+            {
+                "severity": "medium",
+                "type": "multi_token",
+                "title": f"Case is denominated in {primary}; {len(others)} other "
+                         f"token(s) also moved",
+                "detail": (
+                    f"This wallet's funds moved in more than one token. Every "
+                    f"amount and percentage in this report is {primary} only. "
+                    f"Also observed: {listed}. Amounts in different tokens are "
+                    f"NOT added together - one unit of one token is not worth "
+                    f"one unit of another - so each token is traced and ranked "
+                    f"separately. Re-run the trace against another token to "
+                    f"follow that leg of the case."
+                ),
+                "addresses": [seed_norm],
+                "metrics": {"primary_token": primary, "other_tokens": others},
+            }
+        )
 
     # ---- 0. reported vs observed -----------------------------------------
     reported = getattr(result.investigation, "reported_amount", None)
@@ -222,7 +257,7 @@ def build_case_summary(result: InvestigationResult) -> Dict[str, Any]:
                     if verified
                     else f"convergence of {n_src} traced wallets (unverified)"
                     + (
-                        f"; {conv_taint * 100:.1f}% of traced funds arrived here"
+                        f"; {conv_taint * 100:.1f}% of the traced {primary} arrived here"
                         if conv_taint > 0
                         else ""
                     )
@@ -313,7 +348,7 @@ def build_case_summary(result: InvestigationResult) -> Dict[str, Any]:
                 "title": f"{_BEHAVIOUR_TITLES[prof['behavior']]}: {addr[:10]}...",
                 "detail": (
                     f"{addr} - {'; '.join(prof['signals'])}. "
-                    f"{taint * 100:.1f}% of the traced funds passed through here. "
+                    f"{taint * 100:.1f}% of the traced {primary} passed through here. "
                     f"UNVERIFIED behavioural classification "
                     f"(confidence {prof['confidence']:.2f}) - corroborate off-chain "
                     f"before acting."
@@ -356,7 +391,7 @@ def build_case_summary(result: InvestigationResult) -> Dict[str, Any]:
     for ep in result.candidate_endpoints[:8]:
         verified = ep.address.entity_type.value in ("exchange", "sanctioned")
         priority = round(0.70 * ep.taint_fraction + 0.30 * ep.entity_confidence, 2)
-        bits = [f"{ep.taint_fraction * 100:.1f}% of traced funds arrived here"]
+        bits = [f"{ep.taint_fraction * 100:.1f}% of the traced {primary} arrived here"]
         if ep.address.label:
             bits.append(f"labelled {ep.address.label}")
         elif ep.is_terminal:
@@ -452,13 +487,29 @@ def build_case_summary(result: InvestigationResult) -> Dict[str, Any]:
 
 
 def _native(result: InvestigationResult) -> str:
+    """The token the case is denominated in: whichever the SEED moved in the
+    most transfers. It used to be the graph-wide most frequent symbol, which
+    could stamp one token's name on figures that were a sum of several."""
+    seed = result.seed_address.address
+    seed_norm = seed.lower() if result.seed_address.chain.is_evm else seed
     counts: Dict[str, int] = defaultdict(int)
     for e in result.graph.edges:
-        if e.transfer.token_symbol:
+        if e.transfer.token_symbol and e.transfer.normalized_from() == seed_norm:
             counts[e.transfer.token_symbol] += 1
+    if not counts:
+        for e in result.graph.edges:
+            if e.transfer.token_symbol:
+                counts[e.transfer.token_symbol] += 1
     if not counts:
         return result.seed_address.chain.native_symbol
     return max(counts, key=counts.get)
+
+
+def _token_totals(result: InvestigationResult) -> Dict[str, float]:
+    totals: Dict[str, float] = defaultdict(float)
+    for e in result.graph.edges:
+        totals[e.transfer.token_symbol or "?"] += e.transfer.amount_float
+    return dict(totals)
 
 
 def _dur(secs: float) -> str:

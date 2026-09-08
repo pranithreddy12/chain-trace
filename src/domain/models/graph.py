@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 from typing import Dict, List, Optional, Set
 from datetime import datetime
 import networkx as nx
@@ -21,7 +21,13 @@ class GraphNode(BaseModel):
     is_endpoint: bool = False
     is_suspicious: bool = False
     is_obfuscation_point: bool = False
-    # taint = how much of the SEED's money reached this wallet (haircut model)
+    # taint = how much of the SEED's money reached this wallet (haircut model).
+    # Tracked PER TOKEN - units of different tokens are not commensurable, so
+    # they are never summed. The headline pair below is the strongest single
+    # token's share, and taint_token names which token that is.
+    taint_by_token: Dict[str, float] = Field(default_factory=dict)
+    tainted_by_token: Dict[str, float] = Field(default_factory=dict)
+    taint_token: Optional[str] = None
     tainted_value: float = 0.0
     taint_fraction: float = 0.0
     # label-independent behavioural verdict (UNVERIFIED, Tier-3/4)
@@ -83,7 +89,25 @@ class TransactionGraph(BaseModel):
         self.nodes[node.address.address] = node
         self._nx_graph = None
 
+    _edge_keys: Set[tuple] = PrivateAttr(default_factory=set)
+
     def add_edge(self, edge: GraphEdge) -> None:
+        # One on-chain transfer must never be counted twice. Paginated provider
+        # responses and retries can hand back the same transfer more than once,
+        # which silently doubled amounts and taint. A tx hash can legitimately
+        # carry several transfers (batch payouts), so the identity is the hash
+        # plus the from/to/token it moved.
+        t = edge.transfer
+        key = (
+            t.transaction_hash,
+            t.normalized_from(),
+            t.normalized_to(),
+            t.token_symbol,
+            t.amount,
+        )
+        if key in self._edge_keys:
+            return
+        self._edge_keys.add(key)
         self.edges.append(edge)
         self._nx_graph = None
 

@@ -40,6 +40,17 @@ class Transfer(BaseModel):
         except (ValueError, TypeError):
             return 0.0
 
+    @property
+    def amount_is_usable(self) -> bool:
+        """False for amounts that cannot be reasoned about: unparseable (which
+        `amount_float` reports as a silent 0.0, indistinguishable from a real
+        zero) or negative. Callers must drop these AND say so - quietly
+        treating them as zero deflates taint with no trace."""
+        try:
+            return float(self.amount) > 0
+        except (ValueError, TypeError):
+            return False
+
     def normalized_from(self) -> str:
         if self.chain.is_evm:
             return self.from_address.lower()

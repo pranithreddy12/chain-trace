@@ -523,22 +523,6 @@ window.addEventListener('error', function(e){
   }
   applyForces(true);
 
-  function coreCenter(){
-    var pts = DATA.nodes.filter(function(n){
-      return typeof n.x === 'number' &&
-        (n.isSeed || n.isSuspicious || n.isEndpoint || n.onPath);
-    });
-    if (pts.length < 2) pts = DATA.nodes.filter(function(n){ return typeof n.x === 'number'; });
-    if (!pts.length) return null;
-    var xs = pts.map(function(n){return n.x;}), ys = pts.map(function(n){return n.y;});
-    return {x:(Math.min.apply(null,xs)+Math.max.apply(null,xs))/2,
-            y:(Math.min.apply(null,ys)+Math.max.apply(null,ys))/2};
-  }
-  function isCore(n){
-    return n.isSeed || n.isSuspicious || n.isEndpoint || n.isObf || n.onPath
-        || n.type === 'exchange' || n.type === 'sanctioned_address';
-  }
-  var CORE_N = DATA.nodes.filter(isCore).length;
   // ms MUST stay below the settling-interval below: zoomToFit's tween is
   // cancelled by the next call, so a long one never reaches its target and
   // the graph stays zoomed out in a corner.
@@ -547,14 +531,11 @@ window.addEventListener('error', function(e){
     try {
       // No centerAt here: zoomToFit pans and zooms itself, and a second
       // concurrent tween just fights it, leaving the graph off-centre.
-      // fit to the core only when there's enough of it to frame the picture;
-      // otherwise fit the whole constellation
-      // Framing only the core is fine on a small graph, but on a big one it
-      // leaves most of the constellation outside the viewport.
-      // padding has to clear the node LABELS too, not just the dots - a wide
-      // address caption on the last hop otherwise hangs off the edge.
-      if (CORE_N >= 5 && DATA.nodes.length <= 60) Graph.zoomToFit(ms, 95, isCore);
-      else Graph.zoomToFit(ms, 60);
+      // Always fit EVERY node. Framing only the "core" wallets clipped whole
+      // hops off the top and bottom whenever the interesting nodes did not
+      // happen to span the graph, so a deeper trace could look emptier than a
+      // shallow one. Padding clears the address captions, not just the dots.
+      Graph.zoomToFit(ms, DATA.nodes.length <= 60 ? 80 : 55);
       var z = Graph.zoom();
       // No meaningful zoom floor: clamping the fit is what pushed big graphs
       // off-screen. Stars stay readable via the min-screen-radius in the
